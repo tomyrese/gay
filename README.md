@@ -17,32 +17,43 @@ Dự án cung cấp mã nguồn Python hoàn chỉnh, công cụ cân chỉnh ch
 
 ---
 
-## 🦾 2. Phân Bổ Kênh Servo Trên PCA9685
+## 🦾 2. Phân Bổ Kênh Servo Trên PCA9685 (Đã đảo kênh Left & Right)
 
-| Kênh (Channel) | Tên Servo | Dải góc an toàn | Góc chuẩn (Home) |
-| :---: | :--- | :---: | :---: |
-| **0** | **Servo Quay Chân (Đế xoay)** | `0° - 180°` | `90°` |
-| **1** | **Servo Trái (Khớp vai)** | `10° - 170°` | `90°` |
-| **2** | **Servo Phải (Khớp khuỷu)** | `10° - 170°` | `90°` |
-| **3** | **Servo Tay Gắp (Kẹp)** | `0° - 180°` | `30°` (Mở) — `130°` (Kẹp chặt) |
+| Kênh (Channel) | Tên Servo | Dải góc | Đảo chiều quay (Reverse) | Ghi chú |
+| :---: | :--- | :---: | :---: | :--- |
+| **0** | **Servo Quay Chân (Đế xoay)** | `0° - 180°` | `False` | Tích hợp **Auto-Detach** (Tự ngắt xung khi đến nơi để dừng hẳn) |
+| **1** | **Servo Phải (Khớp khuỷu)** | `10° - 170°` | `True (180° - θ)` | Đã đổi sang Kênh 1 & đảo chiều |
+| **2** | **Servo Trái (Khớp vai)** | `10° - 170°` | `True (180° - θ)` | Đã đổi sang Kênh 2 & đảo chiều |
+| **3** | **Servo Tay Gắp (Kẹp)** | `0° - 180°` | `False` | `30°` (Mở) — `135°` (Kẹp chặt) |
 
 ---
 
-## 🛠️ 3. Công Cụ Cân Chỉnh & Khắc Phục Sự Cố (`calibrate.py`)
+## ⚡ 3. Giải Pháp Xử Lý Các Hiện Tượng Vừa Cập Nhật
 
-Chạy công cụ hỗ trợ:
+### 1. Hiện tượng "Chân đế quay đúng vị trí nhưng vẫn quay tiếp":
+- **Nguyên nhân:** PCA9685 tiếp tục phát tín hiệu PWM sau khi lệnh gửi đi. Nếu servo đế là loại 360° hoặc biến trở bị trôi nhẹ, nó sẽ tiếp tục quay mà không dừng lại.
+- **Giải pháp:** Đã kích hoạt tính năng **`AUTO_DETACH_BASE = True`** trong `config.py` và `arm_controller.py`. Khi servo chân đế quay đến đúng góc đích, hệ thống sẽ tự động ngắt xung PWM (`fraction = None`), giúp chân đế **dừng lại ngay lập tức và cố định vị trí**.
+
+### 2. Đảo ngược Servo Left và Right:
+- Đã hoán đổi: **Servo Phải = Kênh 1**, **Servo Trái = Kênh 2**.
+- Đã kích hoạt chế độ **`reverse_direction = True`** (`180 - angle`) cho cả hai khớp nâng hạ giúp chiều nâng/hạ hoạt động đúng theo trực giác và chuyển động đối xứng.
+
+---
+
+## 🛠️ 4. Công Cụ Cân Chỉnh & Kiểm Tra (`calibrate.py`)
+
 ```bash
 python calibrate.py
 ```
 
 ### Chức năng:
-1. **Chế độ cân cữ cơ khí (Zero Alignment - 90°):** Đưa toàn bộ servo về góc 90° trước khi siết ốc tay đòn cơ khí.
-2. **Cân chỉnh tay gắp từng độ (+1°, -1°, +5°, -5°):** Tìm góc đóng/mở chuẩn xác nhất sao cho kẹp vật thật chặt mà không bị nóng servo.
-3. **Kiểm tra Servo 360°:** Phát hiện xem servo có bị nhầm loại quay liên tục 360 độ hoặc bị gãy chốt chặn bên trong hay không.
+1. **Chế độ căn cữ cơ khí (Zero Alignment - 90°):** Đưa toàn bộ servo về góc 90° trước khi siết ốc tay đòn cơ khí.
+2. **Cân chỉnh tay gắp từng độ (+1°, -1°, +5°, -5°):** Tìm góc đóng/mở chuẩn xác nhất sao cho kẹp vật thật chặt.
+3. **Kiểm tra Servo 360°:** Kiểm tra servo đế có bị trôi hoặc nhầm loại 360 độ hay không.
 
 ---
 
-## 💻 4. Hướng Dẫn Chạy Các File
+## 💻 5. Hướng Dẫn Chạy Các File
 
 ```bash
 # 1. Cài đặt thư viện
@@ -57,17 +68,3 @@ python simple_example.py
 # 4. Giao diện điều khiển đầy đủ (Menu CLI)
 python main.py
 ```
-
----
-
-## ⚠️ 5. Khắc Phục Các Hiện Tượng Thường Gặp
-
-### ❌ Hiện tượng 1: Servo quay liên tục không dừng lại
-1. **Do dùng nhầm Servo 360°:** Servo 360° không thể điều khiển vị trí góc cố định mà dùng để điều khiển vận tốc. Hãy thay bằng Servo 180° (Position Control).
-2. **Do dải xung quá rộng:** Code đã được cập nhật dải xung an toàn `600µs – 2400µs` trong `config.py` để tránh servo bị quá cữ biến trở.
-3. **Do mất GND chung:** Kiểm tra xem cực Âm (-) của nguồn ngoài đã được nối chung vào chân GND của Raspberry Pi chưa.
-
-### ❌ Hiện tượng 2: Tay gắp kẹp không chặt / lỏng lẻo
-1. **Lắp sai góc tay đòn:** Hãy chạy `python calibrate.py` -> chọn `[1]` để đưa servo về `90°`, sau đó tháo ốc tay đòn kẹp và gắn lại ở vị trí trung gian rồi siết ốc.
-2. **Góc kẹp chưa đủ sâu:** Mở `config.py` và tăng `close_angle` lên `130` hoặc `140` (tùy theo cơ cấu kẹp của bạn).
-3. **Nguồn cấp yếu (Tụt áp):** Khi kẹp vật, dòng điện tăng vọt. Hãy đảm bảo nguồn cấp cho cọc `V+` đạt từ **5V - 6V (tối thiểu 3A - 5A)** và dây nối đủ to.

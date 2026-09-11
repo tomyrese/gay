@@ -12,9 +12,20 @@ PWM_FREQUENCY = 50
 OE_PIN = None  # Đặt số chân BCM (ví dụ: 17) nếu nối OE với GPIO, hoặc None nếu nối thẳng xuống GND
 
 # -------------------------------------------------------------------------
-# CẤU HÌNH DẢI XUNG AN TOÀN CHO TỪNG SERVO (Đơn vị: microseconds)
-# Khắc phục lỗi servo quay liên tục do tràn dải xung:
-# - Dải an toàn tiêu chuẩn cho SG90 / MG90S / MG996R là 600us đến 2400us
+# TỰ ĐỘNG NGẮT XUNG (AUTO-DETACH) KHI ĐÃ ĐẾN VỊ TRÍ
+# Giải quyết triệt để vấn đề: "Chân đế quay đúng vị trí nhưng vẫn quay tiếp"
+# Khi bật tính năng này: Sau khi servo quay đến góc đích, code sẽ tự động
+# ngắt xung PWM (duty_cycle = 0 / angle = None) để servo dừng hẳn, không bị quay trôi.
+# -------------------------------------------------------------------------
+AUTO_DETACH_BASE = True     # Tự động ngắt xung cho Servo chân đế sau khi quay xong
+AUTO_DETACH_ALL = False     # Tự động ngắt xung cho tất cả các khớp sau khi quay xong
+DETACH_SETTLE_TIME = 0.4    # Thời gian chờ (giây) để servo đến vị trí trước khi ngắt xung
+
+# -------------------------------------------------------------------------
+# PHÂN BỔ KÊNH VÀ ĐẢO CHIỀU SERVO (SERVO CONFIGURATION)
+# ĐÃ ĐẢO NGƯỢC KÊNH VÀ CHIỀU CỦA SERVO LEFT VÀ RIGHT THEO YÊU CẦU:
+# - Servo Trái (Left):  Kênh 2 (Đảo chiều reverse_direction = True)
+# - Servo Phải (Right): Kênh 1 (Đảo chiều reverse_direction = True)
 # -------------------------------------------------------------------------
 SERVO_CONFIG = {
     "BASE": {
@@ -25,28 +36,30 @@ SERVO_CONFIG = {
         "min_angle": 0,
         "max_angle": 180,
         "home": 90,
-        "is_continuous": False,  # Đặt True nếu bạn dùng servo xoay 360 độ liên tục
-        "stop_pulse_360": 1500,  # Xung dừng cho servo 360 độ (thường từ 1480us - 1520us)
+        "reverse_direction": False, # Đặt True nếu muốn đổi chiều quay trái/phải của đế
+        "auto_detach": True,        # Tự ngắt xung sau khi quay để không bị quay tiếp
     },
     "LEFT": {
-        "channel": 1,
+        "channel": 2,               # ĐÃ ĐẢO: Kênh 2 (trước là 1)
         "name": "Servo Trái (Khớp Vai)",
         "min_pulse": 600,
         "max_pulse": 2400,
         "min_angle": 10,
         "max_angle": 170,
         "home": 90,
-        "is_continuous": False,
+        "reverse_direction": True,  # ĐÃ ĐẢO CHIỀU QUAY (180 - angle)
+        "auto_detach": False,
     },
     "RIGHT": {
-        "channel": 2,
+        "channel": 1,               # ĐÃ ĐẢO: Kênh 1 (trước là 2)
         "name": "Servo Phải (Khớp Khuỷu)",
         "min_pulse": 600,
         "max_pulse": 2400,
         "min_angle": 10,
         "max_angle": 170,
         "home": 90,
-        "is_continuous": False,
+        "reverse_direction": True,  # ĐÃ ĐẢO CHIỀU QUAY (180 - angle)
+        "auto_detach": False,
     },
     "GRIPPER": {
         "channel": 3,
@@ -56,9 +69,9 @@ SERVO_CONFIG = {
         "min_angle": 0,
         "max_angle": 180,
         "home": 60,
-        # Góc mở và đóng thực tế (sử dụng calibrate.py để xác định chính xác theo khung cơ khí của bạn)
-        "open_angle": 30,    # Góc mở hoàn toàn ngàm kẹp
-        "close_angle": 130,  # Góc siết kẹp chặt giữ vật thể (tăng lên nếu chưa kẹp chặt)
-        "is_continuous": False,
+        "open_angle": 30,           # Góc mở rộng kẹp
+        "close_angle": 135,         # Góc kẹp chặt vật
+        "reverse_direction": False, # Đặt True nếu kẹp bị đảo ngược mở/đóng
+        "auto_detach": False,       # Giữ xung PWM để duy trì lực ép giữ vật
     },
 }

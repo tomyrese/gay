@@ -16,7 +16,10 @@ from config import (
     I2C_ADDRESS,
     PWM_FREQUENCY,
     OE_PIN,
-    SERVO_CONFIG
+    SERVO_CONFIG,
+    DETACH_SETTLE_TIME,
+    AUTO_DETACH_BASE,
+    AUTO_DETACH_ALL
 )
 
 
@@ -24,25 +27,19 @@ class RoboticArm:
     """
     Lớp điều khiển cánh tay gắp 4 bậc tự do qua PCA9685.
     
-    Phân bổ kênh:
-        - Kênh 0: Servo quay chân (Đế)
-        - Kênh 1: Servo trái (Vai)
-        - Kênh 2: Servo phải (Khuỷu)
-        - Kênh 3: Servo tay gắp (Kẹp)
+    Hỗ trợ:
+      - Đảo chiều quay (reverse_direction) cho từng servo độc lập.
+      - Tự động ngắt xung (auto_detach) chống trôi/quay tiếp khi đã đến góc.
+      - Chuyển động mượt mà (smooth motion interpolation).
     """
 
     def __init__(self, i2c_address: int = I2C_ADDRESS, oe_pin: Optional[int] = OE_PIN):
-        """
-        Khởi tạo kết nối PCA9685 và thiết lập các góc mặc định.
-        """
         self.i2c_address = i2c_address
         self.oe_pin = oe_pin
         self.oe_gpio_initialized = False
 
-        # Khởi tạo chân OE (nếu được cấu hình và chạy trên Linux / Raspberry Pi)
         self._init_oe_pin()
 
-        # Khởi tạo Adafruit ServoKit (16 kênh)
         if ServoKit is None:
             raise ImportError(
                 "Chưa cài đặt thư viện adafruit-circuitpython-servokit. "
@@ -58,12 +55,11 @@ class RoboticArm:
             self.kit.servo[ch].set_pulse_width_range(cfg["min_pulse"], cfg["max_pulse"])
             self.kit.servo[ch].actuation_range = 180
 
-        # Lưu góc hiện tại của các servo
+        # Lưu góc logic hiện tại của các servo
         self.current_angles: Dict[str, float] = {
             key: cfg["home"] for key, cfg in SERVO_CONFIG.items()
         }
 
-        # Bật ngõ ra OE (kéo xuống LOW)
         self.enable_outputs()
         print("[PCA9685] Khởi tạo thành công 4 kênh Servo!")
 
@@ -93,32 +89,72 @@ class RoboticArm:
             GPIO.output(self.oe_pin, GPIO.HIGH)
             print("[PCA9685] Đã ngắt ngõ ra servo (OE = HIGH).")
 
+    def _calculate_hardware_angle(self, servo_key: str, logical_angle: float) -> float:
+        """
+        Tính toán góc phần cứng thực tế gửi xuống servo dựa trên cấu hình đảo chiều (reverse_direction).
+        """
+        cfg = SERVO_CONFIG[servo_key]
+        if cfg.get("reverse_direction", False):
+            # Đảo ngược góc: 0 -> 180, 180 -> 0
+            return 180.0 - logical_angle
+        return logical_angle
+
     def _clamp_angle(self, servo_key: str, angle: float) -> float:
-        """Kiểm tra và giới hạn góc quay trong khoảng an toàn."""
+        """Kiểm tra và giới hạn góc quay logic trong khoảng an toàn."""
         cfg = SERVO_CONFIG[servo_key]
         min_a, max_a = cfg["min_angle"], cfg["max_angle"]
         if angle < min_a:
-            print(f"[Cảnh báo] {cfg['name']}: Góc {angle}° nhỏ hơn giới hạn {min_a}°. Tự động gán = {min_a}°")
+            print(f"[Cảnh báo] {cfg['name']}: Góc {angle}° < {min_a}°. Tự động gán = {min_a}°")
             return float(min_a)
         if angle > max_a:
-            print(f"[Cảnh báo] {cfg['name']}: Góc {angle}° lớn hơn giới hạn {max_a}°. Tự động gán = {max_a}°")
+            print(f"[Cảnh báo] {cfg['name']}: Góc {angle}° > {max_a}°. Tự động gán = {max_a}°")
             return float(max_a)
         return float(angle)
 
-    def set_angle_instant(self, servo_key: str, angle: float):
+    def detach_servo(self, servo_key: str):
+        """
+        Ngắt xung PWM cho một servo cụ thể để dừng quay hoàn toàn và chống rung nóng.
+        """
+        servo_key = servo_key.upper()
+        if servo_key in SERVO_CONFIG:
+            ch = SERVO_CONFIG[servo_key]["channel"]
+            try:
+                self.kit.servo[ch].fraction = None
+            except Exception:
+                try:
+                    self.kit._pca.channels[ch].duty_cycle = 0
+                except Exception:
+                    pass
+
+    def set_angle_instant(self, servo_key: str, angle: float, auto_detach: Optional[bool] = None):
         """Đặt góc ngay lập tức cho 1 servo."""
         servo_key = servo_key.upper()
         if servo_key not in SERVO_CONFIG:
             raise ValueError(f"Tên servo không hợp lệ: {servo_key}.")
 
         target_angle = self._clamp_angle(servo_key, angle)
+        hw_angle = self._calculate_hardware_angle(servo_key, target_angle)
         channel = SERVO_CONFIG[servo_key]["channel"]
-        self.kit.servo[channel].angle = target_angle
+        
+        self.kit.servo[channel].angle = hw_angle
         self.current_angles[servo_key] = target_angle
 
-    def move_smooth(self, servo_key: str, target_angle: float, speed: float = 1.0, steps: int = 30):
+        # Kiểm tra tự động ngắt xung
+        should_detach = auto_detach if auto_detach is not None else SERVO_CONFIG[servo_key].get("auto_detach", False)
+        if should_detach or AUTO_DETACH_ALL or (servo_key == "BASE" and AUTO_DETACH_BASE):
+            time.sleep(DETACH_SETTLE_TIME)
+            self.detach_servo(servo_key)
+
+    def move_smooth(
+        self,
+        servo_key: str,
+        target_angle: float,
+        speed: float = 1.0,
+        steps: int = 30,
+        auto_detach: Optional[bool] = None
+    ):
         """
-        Di chuyển 1 servo một cách mượt mà từ góc hiện tại tới góc đích.
+        Di chuyển 1 servo mượt mà từ góc hiện tại tới góc đích.
         """
         servo_key = servo_key.upper()
         target_angle = self._clamp_angle(servo_key, target_angle)
@@ -133,11 +169,19 @@ class RoboticArm:
 
         for step in range(1, steps + 1):
             inter_angle = current_angle + (delta * step)
-            self.kit.servo[channel].angle = inter_angle
+            hw_angle = self._calculate_hardware_angle(servo_key, inter_angle)
+            self.kit.servo[channel].angle = hw_angle
             time.sleep(delay)
 
-        self.kit.servo[channel].angle = target_angle
+        final_hw_angle = self._calculate_hardware_angle(servo_key, target_angle)
+        self.kit.servo[channel].angle = final_hw_angle
         self.current_angles[servo_key] = target_angle
+
+        # Tự động ngắt xung nếu được cấu hình (ngăn xoay tiếp / quay trôi)
+        should_detach = auto_detach if auto_detach is not None else SERVO_CONFIG[servo_key].get("auto_detach", False)
+        if should_detach or AUTO_DETACH_ALL or (servo_key == "BASE" and AUTO_DETACH_BASE):
+            time.sleep(DETACH_SETTLE_TIME)
+            self.detach_servo(servo_key)
 
     def move_all_smooth(
         self,
@@ -146,7 +190,8 @@ class RoboticArm:
         right: Optional[float] = None,
         gripper: Optional[float] = None,
         speed: float = 1.0,
-        steps: int = 40
+        steps: int = 40,
+        detach_base_after: bool = True
     ):
         """
         Điều khiển đồng thời cả 4 servo chuyển động mượt mà cùng lúc.
@@ -171,12 +216,19 @@ class RoboticArm:
         for step in range(1, steps + 1):
             for k in targets:
                 curr = start_angles[k] + (deltas[k] * step)
-                self.kit.servo[SERVO_CONFIG[k]["channel"]].angle = curr
+                hw_a = self._calculate_hardware_angle(k, curr)
+                self.kit.servo[SERVO_CONFIG[k]["channel"]].angle = hw_a
             time.sleep(delay)
 
         for k in targets:
-            self.kit.servo[SERVO_CONFIG[k]["channel"]].angle = targets[k]
+            final_hw = self._calculate_hardware_angle(k, targets[k])
+            self.kit.servo[SERVO_CONFIG[k]["channel"]].angle = final_hw
             self.current_angles[k] = targets[k]
+
+        # Ngắt xung cho servo chân đế sau khi di chuyển đồng thời để đế dừng cố định
+        if "BASE" in targets and (detach_base_after or AUTO_DETACH_BASE or SERVO_CONFIG["BASE"].get("auto_detach", False)):
+            time.sleep(DETACH_SETTLE_TIME)
+            self.detach_servo("BASE")
 
     # --- Các hàm điều khiển nhanh ---
 
@@ -200,19 +252,17 @@ class RoboticArm:
 
     def set_gripper(self, angle: float, smooth: bool = True, speed: float = 1.2):
         if smooth:
-            self.move_smooth("GRIPPER", angle, speed=speed)
+            self.move_smooth("GRIPPER", angle, speed=speed, auto_detach=False)
         else:
-            self.set_angle_instant("GRIPPER", angle)
+            self.set_angle_instant("GRIPPER", angle, auto_detach=False)
 
     def open_gripper(self, smooth: bool = True):
-        """Mở kẹp."""
         open_a = SERVO_CONFIG["GRIPPER"].get("open_angle", 30)
         print(f"[Tay Gắp] Mở kẹp ({open_a}°)...")
         self.set_gripper(open_a, smooth=smooth)
 
     def close_gripper(self, smooth: bool = True):
-        """Đóng kẹp chặt để giữ vật."""
-        close_a = SERVO_CONFIG["GRIPPER"].get("close_angle", 130)
+        close_a = SERVO_CONFIG["GRIPPER"].get("close_angle", 135)
         print(f"[Tay Gắp] Đóng kẹp chặt ({close_a}°)...")
         self.set_gripper(close_a, smooth=smooth)
 
@@ -287,6 +337,8 @@ class RoboticArm:
 
     def cleanup(self):
         print("[Robotic Arm] Đang dọn dẹp và tắt kết nối...")
+        for key in SERVO_CONFIG:
+            self.detach_servo(key)
         self.disable_outputs()
         if self.oe_gpio_initialized:
             try:
