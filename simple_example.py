@@ -1,8 +1,6 @@
 """
-Ví dụ cơ bản điều khiển 4 Servo tay gắp sử dụng PCA9685.
-Đã cập nhật:
-- Hoán đổi kênh: Servo Trái (Kênh 2), Servo Phải (Kênh 1)
-- Chống chân đế quay trôi: Tự ngắt xung (detach) chân đế sau khi đã quay tới góc đích.
+Mã nguồn điều khiển kiểm tra đơn giản và an toàn cho 4 Servo qua PCA9685.
+Không tự động chạy vòng lặp; người dùng nhập góc trực tiếp cho từng servo.
 """
 
 import time
@@ -11,81 +9,68 @@ from adafruit_servokit import ServoKit
 # 1. Khởi tạo PCA9685
 kit = ServoKit(channels=16, address=0x40)
 
-# 2. Cấu hình dải xung an toàn (600us - 2400us) cho 4 kênh
-for channel in range(4):
-    kit.servo[channel].set_pulse_width_range(600, 2400)
-    kit.servo[channel].actuation_range = 180
+# 2. Cấu hình dải xung an toàn
+for ch in range(4):
+    kit.servo[ch].set_pulse_width_range(600, 2400)
+    kit.servo[ch].actuation_range = 180
 
-# 3. Phân bổ kênh Servo (ĐÃ ĐẢO KÊNH LEFT & RIGHT THEO YÊU CẦU)
-CH_BASE = 0      # Kênh 0: Servo quay chân (Đế)
-CH_RIGHT = 1     # Kênh 1: Servo Phải (Khuỷu)
-CH_LEFT = 2      # Kênh 2: Servo Trái (Vai)
-CH_GRIPPER = 3   # Kênh 3: Servo Tay Gắp (Kẹp)
+# 3. Phân bổ kênh Servo (Nhìn từ mặt trước cánh tay)
+CH_BASE    = 0   # Kênh 0: Servo Quay Chân Đế
+CH_LEFT    = 1   # Kênh 1: Servo Left (NÂNG HẠ CÁNH TAY)
+CH_RIGHT   = 2   # Kênh 2: Servo Right (ĐIỀU KHIỂN GÓC CÁNH TAY)
+CH_GRIPPER = 3   # Kênh 3: Servo Tay Gắp (Kẹp / Mở)
 
-GRIPPER_OPEN = 30
-GRIPPER_CLOSE = 135
-
-def set_base_angle(angle):
-    """Quay chân đế tới góc mong muốn và tự ngắt xung để dừng hẳn, không quay tiếp."""
-    kit.servo[CH_BASE].angle = angle
-    # Chờ 0.4s để servo quay tới nơi rồi ngắt xung PWM thả trôi
-    time.sleep(0.4)
-    kit.servo[CH_BASE].fraction = None
-
-def set_arm_pose(base, left, right, gripper):
-    """Đặt góc cho cả 4 servo (có đảo chiều góc cho Left và Right)."""
-    # Đảo chiều góc (180 - angle) cho 2 khớp vai và khuỷu
-    actual_left = 180 - left
-    actual_right = 180 - right
-
-    kit.servo[CH_BASE].angle = base
-    kit.servo[CH_LEFT].angle = actual_left
-    kit.servo[CH_RIGHT].angle = actual_right
-    kit.servo[CH_GRIPPER].angle = gripper
-    time.sleep(0.4)
-    # Ngắt xung chân đế để đế đứng yên không bị xoay tiếp
-    kit.servo[CH_BASE].fraction = None
-    print(f"-> Base: {base}°, Left: {left}°, Right: {right}°, Gripper: {gripper}°")
+def set_servo(channel, angle, detach_after=False):
+    """Đặt góc cho 1 servo và tùy chọn ngắt xung chống trôi/nóng."""
+    kit.servo[channel].angle = angle
+    print(f"-> Kênh {channel} đã quay tới {angle}°")
+    if detach_after:
+        time.sleep(0.35)
+        kit.servo[channel].fraction = None
+        print(f"-> Đã ngắt xung Kênh {channel} để giữ cố định.")
 
 def main():
-    print("=== BẮT ĐẦU CHẠY THỬ NGHIỆM TAY GẮP ROBOT ===")
+    print("=" * 55)
+    print("  KIỂM TRA TỪNG SERVO ĐỘC LẬP (KHÔNG CHẠY TỰ ĐỘNG)")
+    print("=" * 55)
+    print(f" 0: Chân Đế (Kênh {CH_BASE})")
+    print(f" 1: Servo Left - Nâng Hạ Cánh Tay (Kênh {CH_LEFT})")
+    print(f" 2: Servo Right - Điều Khiển Góc Cánh Tay (Kênh {CH_RIGHT})")
+    print(f" 3: Servo Tay Gắp (Kênh {CH_GRIPPER})")
+    print("=" * 55)
 
-    # 1. Đưa tất cả về vị trí góc Home (90, 90, 90, 60)
-    print("1. Đưa toàn bộ servo về vị trí Home...")
-    set_arm_pose(base=90, left=90, right=90, gripper=60)
-    time.sleep(1.5)
+    while True:
+        try:
+            ch_str = input("\nChọn kênh muốn test (0, 1, 2, 3) hoặc 'q' để thoát: ").strip()
+            if ch_str.lower() == 'q':
+                break
+            ch = int(ch_str)
+            if ch not in [0, 1, 2, 3]:
+                print("Chỉ chọn kênh từ 0 đến 3!")
+                continue
 
-    # 2. Thử nghiệm quay chân (Base Servo)
-    print("2. Test servo quay chân (45° -> 135° -> 90° và DỪNG HẲN)...")
-    set_base_angle(45)
-    time.sleep(1)
-    set_base_angle(135)
-    time.sleep(1)
-    set_base_angle(90)
-    time.sleep(1)
+            angle_str = input(f"Nhập góc cho kênh {ch} (0 - 180 độ): ").strip()
+            angle = float(angle_str)
+            if not (0 <= angle <= 180):
+                print("Góc phải từ 0 đến 180 độ!")
+                continue
 
-    # 3. Thử nghiệm khớp vai và khớp khuỷu (Left & Right Servos)
-    print("3. Test khớp tay nâng hạ...")
-    kit.servo[CH_LEFT].angle = 180 - 120
-    kit.servo[CH_RIGHT].angle = 180 - 70
-    time.sleep(1.5)
-    kit.servo[CH_LEFT].angle = 180 - 90
-    kit.servo[CH_RIGHT].angle = 180 - 90
-    time.sleep(1)
+            # Nếu là chân đế (ch=0), tự động ngắt xung để dừng hẳn không quay tiếp
+            detach = (ch == CH_BASE)
+            set_servo(ch, angle, detach_after=detach)
 
-    # 4. Thử nghiệm kẹp và nhả tay gắp (Gripper)
-    print(f"4. Test mở ({GRIPPER_OPEN}°) và kẹp chặt ({GRIPPER_CLOSE}°)...")
-    kit.servo[CH_GRIPPER].angle = GRIPPER_OPEN
-    time.sleep(1.5)
-    kit.servo[CH_GRIPPER].angle = GRIPPER_CLOSE
-    time.sleep(2)
-    kit.servo[CH_GRIPPER].angle = 60
-    time.sleep(1)
+        except ValueError:
+            print("Giá trị nhập vào không hợp lệ.")
+        except KeyboardInterrupt:
+            break
 
-    print("=== HOÀN THÀNH THỬ NGHIỆM! ===")
+    # Giải phóng toàn bộ
+    for ch in range(4):
+        try:
+            kit.servo[ch].fraction = None
+        except Exception:
+            pass
+    print("\nĐã ngắt xung toàn bộ servo. Thoát chương trình.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nĐã dừng chương trình bởi người dùng.")
+    main()

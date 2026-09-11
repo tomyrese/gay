@@ -1,77 +1,74 @@
 """
-Cấu hình thông số phần cứng và kênh điều khiển cho PCA9685 & 4 Servo cánh tay gắp.
+Cấu hình chuẩn cho mạch điều khiển PCA9685 và 4 Servo Cánh Tay Robot.
+
+Chức năng các Servo (Nhìn từ mặt trước của cánh tay):
+1. BASE    (Kênh 0): Servo Quay Chân Đế (Quay trái / phải)
+2. LEFT    (Kênh 1): Servo Trái (Nâng hạ cánh tay chính)
+3. RIGHT   (Kênh 2): Servo Phải (Điều khiển góc / vươn gập cánh tay)
+4. GRIPPER (Kênh 3): Servo Tay Gắp (Đóng / Mở kẹp)
 """
 
 # Địa chỉ I2C mặc định của PCA9685
 I2C_ADDRESS = 0x40
 
-# Tần số PWM cho Servo tiêu chuẩn (50Hz = chu kỳ 20ms)
+# Tần số PWM cho Servo (50Hz = chu kỳ 20ms)
 PWM_FREQUENCY = 50
 
-# Cấu hình chân OE (Output Enable) trên Raspberry Pi (Tùy chọn)
-OE_PIN = None  # Đặt số chân BCM (ví dụ: 17) nếu nối OE với GPIO, hoặc None nếu nối thẳng xuống GND
+# Chân OE (Output Enable) trên Raspberry Pi (Tùy chọn, None nếu nối GND)
+OE_PIN = None
+
+# Tự động ngắt xung PWM sau khi quay xong để chống rung lắc, chống nóng và chống trôi servo
+AUTO_DETACH_DEFAULT = True
+DETACH_DELAY = 0.35  # Thời gian chờ servo đến đích trước khi ngắt xung (giây)
 
 # -------------------------------------------------------------------------
-# TỰ ĐỘNG NGẮT XUNG (AUTO-DETACH) KHI ĐÃ ĐẾN VỊ TRÍ
-# Giải quyết triệt để vấn đề: "Chân đế quay đúng vị trí nhưng vẫn quay tiếp"
-# Khi bật tính năng này: Sau khi servo quay đến góc đích, code sẽ tự động
-# ngắt xung PWM (duty_cycle = 0 / angle = None) để servo dừng hẳn, không bị quay trôi.
-# -------------------------------------------------------------------------
-AUTO_DETACH_BASE = True     # Tự động ngắt xung cho Servo chân đế sau khi quay xong
-AUTO_DETACH_ALL = False     # Tự động ngắt xung cho tất cả các khớp sau khi quay xong
-DETACH_SETTLE_TIME = 0.4    # Thời gian chờ (giây) để servo đến vị trí trước khi ngắt xung
-
-# -------------------------------------------------------------------------
-# PHÂN BỔ KÊNH VÀ ĐẢO CHIỀU SERVO (SERVO CONFIGURATION)
-# ĐÃ ĐẢO NGƯỢC KÊNH VÀ CHIỀU CỦA SERVO LEFT VÀ RIGHT THEO YÊU CẦU:
-# - Servo Trái (Left):  Kênh 2 (Đảo chiều reverse_direction = True)
-# - Servo Phải (Right): Kênh 1 (Đảo chiều reverse_direction = True)
+# CẤU HÌNH CHI TIẾT 4 SERVO
 # -------------------------------------------------------------------------
 SERVO_CONFIG = {
     "BASE": {
         "channel": 0,
-        "name": "Servo Quay Chân (Đế)",
+        "name": "Servo Quay Chân (Đế Xoay)",
         "min_pulse": 600,
         "max_pulse": 2400,
         "min_angle": 0,
         "max_angle": 180,
         "home": 90,
-        "reverse_direction": False, # Đặt True nếu muốn đổi chiều quay trái/phải của đế
-        "auto_detach": True,        # Tự ngắt xung sau khi quay để không bị quay tiếp
+        "reversed": False,      # Đổi thành True nếu quay ngược hướng mong muốn
+        "auto_detach": True,    # Luôn ngắt xung để đế dừng khựng đúng vị trí, không quay tiếp
     },
     "LEFT": {
-        "channel": 2,               # ĐÃ ĐẢO: Kênh 2 (trước là 1)
-        "name": "Servo Trái (Khớp Vai)",
+        "channel": 1,
+        "name": "Servo Trái (Nâng Hạ Cánh Tay)",
         "min_pulse": 600,
         "max_pulse": 2400,
         "min_angle": 10,
         "max_angle": 170,
         "home": 90,
-        "reverse_direction": True,  # ĐÃ ĐẢO CHIỀU QUAY (180 - angle)
-        "auto_detach": False,
+        "reversed": False,      # Đổi thành True nếu muốn đảo chiều nâng/hạ
+        "auto_detach": False,   # Giữ xung nếu muốn cánh tay giữ vị trí trên không mà không bị sụp
     },
     "RIGHT": {
-        "channel": 1,               # ĐÃ ĐẢO: Kênh 1 (trước là 2)
-        "name": "Servo Phải (Khớp Khuỷu)",
+        "channel": 2,
+        "name": "Servo Phải (Điều Khiển Góc Cánh Tay)",
         "min_pulse": 600,
         "max_pulse": 2400,
         "min_angle": 10,
         "max_angle": 170,
         "home": 90,
-        "reverse_direction": True,  # ĐÃ ĐẢO CHIỀU QUAY (180 - angle)
-        "auto_detach": False,
+        "reversed": False,      # Đổi thành True nếu muốn đảo chiều góc vươn
+        "auto_detach": False,   # Giữ xung để giữ góc cánh tay
     },
     "GRIPPER": {
         "channel": 3,
-        "name": "Servo Tay Gắp (Kẹp)",
+        "name": "Servo Tay Gắp (Kẹp Vật)",
         "min_pulse": 600,
         "max_pulse": 2400,
         "min_angle": 0,
         "max_angle": 180,
         "home": 60,
-        "open_angle": 30,           # Góc mở rộng kẹp
-        "close_angle": 135,         # Góc kẹp chặt vật
-        "reverse_direction": False, # Đặt True nếu kẹp bị đảo ngược mở/đóng
-        "auto_detach": False,       # Giữ xung PWM để duy trì lực ép giữ vật
+        "open_angle": 30,       # Góc mở ngàm kẹp
+        "close_angle": 135,     # Góc kẹp chặt vật
+        "reversed": False,
+        "auto_detach": False,   # Giữ xung để duy trì lực ép giữ vật không bị rơi
     },
 }

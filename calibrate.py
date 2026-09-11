@@ -44,7 +44,7 @@ def zero_alignment_mode(kit):
     print("1. Tháo ốc gắn tay đòn (càng nhựa) của các servo ra.")
     print("2. Trong lúc servo đang giữ góc 90°, gắn tay đòn vào trục sao cho:")
     print("   - Khớp chân đế: Hướng thẳng về phía trước.")
-    print("   - Khớp vai (Trái) & Khớp khuỷu (Phải): Tạo góc vuông 90° cân đối.")
+    print("   - Khớp Left (Nâng hạ) & Khớp Right (Góc cánh tay): Tạo góc 90° chuẩn.")
     print("   - Khớp tay gắp: Ở vị trí trung gian giữa mở và đóng.")
     print("3. Siết chặt ốc giữ tay đòn.")
     input("\nNhấn Enter để quay lại menu chính...")
@@ -129,7 +129,7 @@ def test_continuous_rotation(kit):
     print("\n" + "=" * 60)
     print(">>> KIỂM TRA SERVO 360° QUAY LIÊN TỤC <<<")
     print("=" * 60)
-    print("Chọn kênh servo bạn muốn kiểm tra (0=Chân đế, 1=Trái, 2=Phải, 3=Tay gắp):")
+    print("Chọn kênh servo bạn muốn kiểm tra (0=Chân đế, 1=Left, 2=Right, 3=Tay gắp):")
     try:
         ch = int(input("Kênh (0-3): ").strip())
     except ValueError:
@@ -184,6 +184,13 @@ def main():
             test_continuous_rotation(kit)
         elif c == '0':
             break
+
+    # Ngắt xung khi thoát
+    for ch in range(4):
+        try:
+            kit.servo[ch].fraction = None
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
