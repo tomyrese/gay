@@ -9,33 +9,56 @@ I2C_ADDRESS = 0x40
 PWM_FREQUENCY = 50
 
 # Cấu hình chân OE (Output Enable) trên Raspberry Pi (Tùy chọn)
-# Chân OE tích cực mức THẤP (LOW = Bật ngõ ra PWM, HIGH = Tắt / thả trôi servo)
-# Nếu nối chân OE trực tiếp xuống GND thì đặt OE_PIN = None
-OE_PIN = None  # Ví dụ: 17 nếu cắm vào BCM GPIO 17 (Chân vật lý 11)
+OE_PIN = None  # Đặt số chân BCM (ví dụ: 17) nếu nối OE với GPIO, hoặc None nếu nối thẳng xuống GND
 
-# Độ rộng xung tối thiểu và tối đa (microseconds) cho Servo (SG90 / MG90S / MG996R)
-# Thường nằm trong khoảng 500us (0 độ) đến 2500us (180 độ)
-SERVO_MIN_PULSE = 500
-SERVO_MAX_PULSE = 2500
-
-# -------------------------------------------------------------
-# PHÂN BỔ KÊNH SERVO TRÊN PCA9685 (0 - 15)
-# -------------------------------------------------------------
-CHANNELS = {
-    "BASE": 0,       # Kênh 0: Servo quay chân (Đế xoay ngang)
-    "LEFT": 1,       # Kênh 1: Servo cánh tay trái (Khớp vai / nâng hạ chính)
-    "RIGHT": 2,      # Kênh 2: Servo cánh tay phải (Khớp khuỷu / vươn tới)
-    "GRIPPER": 3,    # Kênh 3: Servo tay gắp (Kẹp / nhả vật thể)
+# -------------------------------------------------------------------------
+# CẤU HÌNH DẢI XUNG AN TOÀN CHO TỪNG SERVO (Đơn vị: microseconds)
+# Khắc phục lỗi servo quay liên tục do tràn dải xung:
+# - Dải an toàn tiêu chuẩn cho SG90 / MG90S / MG996R là 600us đến 2400us
+# -------------------------------------------------------------------------
+SERVO_CONFIG = {
+    "BASE": {
+        "channel": 0,
+        "name": "Servo Quay Chân (Đế)",
+        "min_pulse": 600,
+        "max_pulse": 2400,
+        "min_angle": 0,
+        "max_angle": 180,
+        "home": 90,
+        "is_continuous": False,  # Đặt True nếu bạn dùng servo xoay 360 độ liên tục
+        "stop_pulse_360": 1500,  # Xung dừng cho servo 360 độ (thường từ 1480us - 1520us)
+    },
+    "LEFT": {
+        "channel": 1,
+        "name": "Servo Trái (Khớp Vai)",
+        "min_pulse": 600,
+        "max_pulse": 2400,
+        "min_angle": 10,
+        "max_angle": 170,
+        "home": 90,
+        "is_continuous": False,
+    },
+    "RIGHT": {
+        "channel": 2,
+        "name": "Servo Phải (Khớp Khuỷu)",
+        "min_pulse": 600,
+        "max_pulse": 2400,
+        "min_angle": 10,
+        "max_angle": 170,
+        "home": 90,
+        "is_continuous": False,
+    },
+    "GRIPPER": {
+        "channel": 3,
+        "name": "Servo Tay Gắp (Kẹp)",
+        "min_pulse": 600,
+        "max_pulse": 2400,
+        "min_angle": 0,
+        "max_angle": 180,
+        "home": 60,
+        # Góc mở và đóng thực tế (sử dụng calibrate.py để xác định chính xác theo khung cơ khí của bạn)
+        "open_angle": 30,    # Góc mở hoàn toàn ngàm kẹp
+        "close_angle": 130,  # Góc siết kẹp chặt giữ vật thể (tăng lên nếu chưa kẹp chặt)
+        "is_continuous": False,
+    },
 }
-
-# Giới hạn góc quay an toàn cho từng Servo (độ) để tránh va chạm cơ khí
-SERVO_LIMITS = {
-    "BASE": {"min": 0, "max": 180, "home": 90, "name": "Servo Quay Chân (Đế)"},
-    "LEFT": {"min": 10, "max": 170, "home": 90, "name": "Servo Trái (Khớp Vai)"},
-    "RIGHT": {"min": 10, "max": 170, "home": 90, "name": "Servo Phải (Khớp Khuỷu)"},
-    "GRIPPER": {"min": 30, "max": 120, "home": 60, "name": "Servo Tay Gắp (Kẹp)"},
-}
-
-# Góc gắp và mở của tay gắp
-GRIPPER_OPEN_ANGLE = 40    # Góc mở kẹp
-GRIPPER_CLOSE_ANGLE = 110  # Góc đóng kẹp (tùy chỉnh vừa lực ép vật thể)

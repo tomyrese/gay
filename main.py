@@ -5,7 +5,7 @@ Chương trình chính (Interactive CLI Menu) điều khiển cánh tay gắp 4 
 import sys
 import time
 from arm_controller import RoboticArm
-from config import SERVO_LIMITS, CHANNELS, GRIPPER_OPEN_ANGLE, GRIPPER_CLOSE_ANGLE
+from config import SERVO_CONFIG
 
 
 def print_menu():
@@ -25,11 +25,12 @@ def print_menu():
 
 
 def test_single_servo(arm: RoboticArm, key: str):
-    info = SERVO_LIMITS[key]
-    print(f"\n--- {info['name']} (Kênh {CHANNELS[key]}) ---")
-    print(f"Giới hạn góc: {info['min']}° đến {info['max']}° | Góc hiện tại: {arm.current_angles[key]}°")
+    info = SERVO_CONFIG[key]
+    ch = info["channel"]
+    print(f"\n--- {info['name']} (Kênh {ch}) ---")
+    print(f"Giới hạn góc: {info['min_angle']}° đến {info['max_angle']}° | Góc hiện tại: {arm.current_angles[key]}°")
     try:
-        val_str = input(f"Nhập góc mong muốn ({info['min']} - {info['max']}) hoặc 'b' để quay lại: ").strip()
+        val_str = input(f"Nhập góc mong muốn ({info['min_angle']} - {info['max_angle']}) hoặc 'b' để quay lại: ").strip()
         if val_str.lower() == 'b':
             return
         angle = float(val_str)
@@ -45,7 +46,7 @@ def manual_4_servos(arm: RoboticArm):
         b_str = input(f"Góc Servo Chân (0-180) [Hiện tại: {arm.current_angles['BASE']}°]: ").strip()
         l_str = input(f"Góc Servo Trái (10-170) [Hiện tại: {arm.current_angles['LEFT']}°]: ").strip()
         r_str = input(f"Góc Servo Phải (10-170) [Hiện tại: {arm.current_angles['RIGHT']}°]: ").strip()
-        g_str = input(f"Góc Tay Gắp ({SERVO_LIMITS['GRIPPER']['min']}-{SERVO_LIMITS['GRIPPER']['max']}) [Hiện tại: {arm.current_angles['GRIPPER']}°]: ").strip()
+        g_str = input(f"Góc Tay Gắp ({SERVO_CONFIG['GRIPPER']['min_angle']}-{SERVO_CONFIG['GRIPPER']['max_angle']}) [Hiện tại: {arm.current_angles['GRIPPER']}°]: ").strip()
 
         b = float(b_str) if b_str else None
         l = float(l_str) if l_str else None
@@ -84,7 +85,7 @@ def sweep_test(arm: RoboticArm):
     time.sleep(0.5)
     arm.close_gripper()
     time.sleep(0.5)
-    arm.set_gripper(60)
+    arm.set_gripper(SERVO_CONFIG["GRIPPER"]["home"])
 
     print("Kiểm tra hoàn tất!")
 
@@ -98,7 +99,6 @@ def main():
         sys.exit(1)
 
     try:
-        # Tự động về vị trí Home khi bắt đầu
         arm.home()
 
         while True:
