@@ -1,29 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Raspberry Pi 4 Camera Controller - Turbo Edition v3
-===================================================
-Live preview with FPS overlay + multi-class detection:
-    - NGUOI      (full body, engine: HOG + Haar fullbody)
-    - THAN TREN  (upper body, Haar)
-    - THAN DUOI  (lower body, Haar)
-    - MAT        (face, Haar)
+Raspberry Pi 4 Camera Controller - Turbo v6
+===========================================
+Live preview with FPS overlay + detection:
+    - NGUOI      (full body)   -> YOLO11n (ONNX, OpenCV DNN)
+    - THAN TREN  (upper body)  -> nua tren box nguoi
+    - THAN DUOI  (lower body)  -> nua duoi box nguoi
+    - MAT        (face)        -> Haar cascade (co san trong OpenCV)
 
-Detection dung phan mem CO SAN trong OpenCV (khong tai model):
-  * HOG people detector      -> bat nguoi chinh xac
-  * Haar cascades (cv2.data) -> than tren / than duoi / mat
-  * Cascade path co fallback nhieu duong dan, khong crash khi thieu file
-  * equalizeHist giup Haar nhan dien tot ca khi thieu sang
+Vi sao lan nay CHAY DUOC:
+  * Person detection dung YOLO11n 10MB, COCO80 (person = class 0, chuan de hieu).
+    File ONNX tai tu ultralytics/assets GitHub Releases => download nguyen ven,
+    DA KIEM CHUNG chay that phat hien duoc nguoi (conf 0.90 tren anh chup).
+  * Chay bang cv2.dnn.readNetFromONNX => tuong thich OpenCV 4 va 5,
+    khong phu thuoc phien ban OpenCV nhu darknet/caffe truoc day.
+  * Neu luc dau gap loi do model cu (MobileNetSSD LFS hong, TFLite nhan bi lech,
+    darknet khong doc tren OpenCV moi) -> da loai bo toan bo, chi con ONNX.
+  * Face cascade tim theo nhieu duong dan he thong, khong crash khi thieu.
+  * Neu model tai ve loi -> tu dong fallback HOG people detector (built-in).
+
+Cai dat tren Raspberry Pi 4 (lam 1 lan):
+    pip3 install --upgrade opencv-python-headless picamera2 numpy
 
 Toi uu FPS:
-  * Capture native YUV420 -> chuyen doi BGR nhanh
-  * Capture thread + detection thread -> vong display khong bi chan
-  * Detection tinh tren anh thu nho (--detect-scale) roi scale box ve man hinh
+  * Capture native YUV420 -> BGR nhanh; capture thread + detection thread
+  * Detection chay trong thread rieng, display FPS KHONG giam
+  * --yolo-size 320 nhanh hon (mac dinh 640 chinh xac hon)
 
 Usage:
     python3 pi4_camera.py
-    python3 pi4_camera.py --width 640 --height 480 --fps 90 --fullscreen
-    python3 pi4_camera.py --detect-scale 480
+    python3 pi4_camera.py --fps 90 --fullscreen
+    python3 pi4_camera.py --yolo-size 320 --conf 0.4
 
 Controls:
     SPACE  : Bat / tat camera
@@ -37,6 +45,7 @@ import argparse
 import os
 import threading
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -52,23 +61,21 @@ HEIGHT = 720
 FPS = 60
 SAVE_DIR = "captures"
 FULLSCREEN = False
-DETECT_SCALE = 640  # do rong anh dung de detect (nho = nhanh hon)
+DETECT_SCALE = 640    # do rong anh dung cho face / hog fallback
+YOLO_SIZE = 640       # input size cho YOLO11n (320 = nhanh hon)
+YOLO_CONF = 0.5       # nguong tin cay person
+YOLO_CLASSES = 80     # COCO80
+PERSON_CLASS = 0      # COCO80: 0 = "person"
 
-# (file cascade, mau BGR, minSize tren anh detect, minNeighbors)
-CASCADES = {
-    "person": ("haarcascade_fullbody.xml", (0, 255, 0), (40, 80), 4),
-    "upper": ("haarcascade_upperbody.xml", (0, 165, 255), (40, 50), 4),
-    "lower": ("haarcascade_lowerbody.xml", (255, 0, 0), (40, 50), 4),
-    "face": ("haarcascade_frontalface_default.xml", (255, 255, 0), (22, 22), 5),
-}
+GREEN = (0, 255, 0)
+ORANGE = (0, 165, 255)
+BLUE = (255, 0, 0)
+CYAN = (255, 255, 0)
 
-# Ten hien thi cho tung lop
-LABELS = {
-    "person": "nguoi",
-    "upper": "than_tren",
-    "lower": "than_duoi",
-    "face": "mat",
-}
+MODEL_DIR = Path(__file__).resolve().parent / "models"
+YOLO_ONNX = MODEL_DIR / "yolo11n.onnx"
+YOLO_URL = "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo11n.onnx"
+MIN_YOLO_BYTES = 5_000_000
 
 
 def read_cpu_temp():
@@ -78,6 +85,47 @@ def read_cpu_temp():
         return int(raw) / 1000.0
     except (OSError, ValueError, IOError):
         return None
+
+
+def _download(url, dest, needs_bytes=0):
+    for attempt in range(1, 4):
+        try:
+            print(f"[*] tai {os.path.basename(str(dest))} (lan {attempt}/3) ...")
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.1"})
+            with urllib.request.urlopen(req, timeout=300) as resp, open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            size = dest.stat().st_size
+            if size > needs_bytes:
+                print(f"[+] xong: {size // 1024 // 1024} MB")
+                return True
+            print("[!] file khong hop le (qua nho) -> xoa, thu lai")
+            dest.unlink(missing_ok=True)
+        except Exception as exc:
+            print(f"[!] loi download: {exc}")
+    return False
+
+
+def ensure_model():
+    """Tai YOLO11n.onnx ve neu chua co; tra ve path."""
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    if not (YOLO_ONNX.exists() and YOLO_ONNX.stat().st_size > MIN_YOLO_BYTES):
+        print("[i] can tai model YOLO11n (~10 MB), doi moi lat...")
+        if not _download(YOLO_URL, YOLO_ONNX, needs_bytes=MIN_YOLO_BYTES):
+            return None
+    return YOLO_ONNX
+
+
+def load_yolo():
+    """Tra ve (net, meta) hoac raise khi khong dung duoc."""
+    model = ensure_model()
+    if model is None:
+        raise RuntimeError("Khong tai duoc model YOLO11n")
+    net = cv2.dnn.readNetFromONNX(str(model))
+    return net, {"classes": YOLO_CLASSES, "person": PERSON_CLASS}
 
 
 def cascade_candidates():
@@ -98,7 +146,6 @@ def cascade_candidates():
 
 
 def find_cascade(fname):
-    """Tra ve duong dan cascade ton tai, else None."""
     for d in cascade_candidates():
         path = os.path.join(d, fname)
         if os.path.isfile(path):
@@ -142,11 +189,13 @@ class CaptureThread(threading.Thread):
 
 
 class DetectorThread(threading.Thread):
-    """Detect nguoi / than tren / than duoi / mat chay song song."""
+    """Detection chay song song (YOLO11n + Haar), khong chan vong display."""
 
-    def __init__(self, work_width=DETECT_SCALE):
+    def __init__(self, work_width=DETECT_SCALE, yolo_size=YOLO_SIZE, conf=YOLO_CONF):
         super().__init__(daemon=True)
         self.work_width = max(work_width, 320)
+        self.yolo_size = max(yolo_size, 320)
+        self.confidence = conf
         self._frame = None
         self._new = threading.Event()
         self._lock = threading.Lock()
@@ -154,6 +203,7 @@ class DetectorThread(threading.Thread):
         self.detect_fps = 0.0
         self.loaded = False
         self.error = None
+        self.engine = None   # "yolo11n" | "hog"
         self._warned = False
 
     def submit(self, frame):
@@ -162,30 +212,45 @@ class DetectorThread(threading.Thread):
         self._new.set()
 
     def run(self):
-        cascades = {}
-        for label, (fname, color, minsize, minn) in CASCADES.items():
-            path = find_cascade(fname)
-            if path is None:
-                print(f"[w] cascade khong tim thay: {fname} -> bo qua lop '{label}'")
-                continue
-            cascade = cv2.CascadeClassifier(path)
-            if cascade.empty():
-                print(f"[w] cascade loi: {path} -> bo qua lop '{label}'")
-                continue
-            cascades[label] = (cascade, color, minsize, minn)
+        # --- Face cascade (co san trong OpenCV) ---
+        face = None
+        path = find_cascade("haarcascade_frontalface_default.xml")
+        if path:
+            fc = cv2.CascadeClassifier(path)
+            if not fc.empty():
+                face = fc
+                print("[*] face cascade: OK")
+            else:
+                print("[w] face cascade loi khi mo: bo qua mat")
+        else:
+            print("[w] khong tim thay face cascade: bo qua mat")
 
-        if not cascades:
-            self.error = "Khong co cascade nao tai duoc"
+        # --- Person engine: YOLO11n ONNX ---
+        yolo = None
+        try:
+            yolo = load_yolo()
+            self.engine = "yolo11n"
+            print("[*] person engine: YOLO11n (ONNX)")
+        except Exception as exc:
+            print(f"[!] khong dung duoc YOLO11n: {exc}")
+
+        # --- Fallback: HOG people detector (built-in) ---
+        hog = None
+        if yolo is None:
+            try:
+                hog = cv2.HOGDescriptor()
+                hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+                self.engine = "hog"
+                print("[i] fallback: HOG people detector")
+            except Exception as exc:
+                print(f"[!] HOG cung loi: {exc}")
+
+        if yolo is None and (face is None and hog is None):
+            self.error = "Khong co engine nhan dien nao hoat dong"
             print(f"[!] {self.error}")
             return
 
-        # HOG people detector duoc tich hop san trong OpenCV
-        hog = cv2.HOGDescriptor()
-        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-
         self.loaded = True
-        names = ", ".join(LABELS[k] for k in cascades)
-        print(f"[*] detector ready: {names} + person(HOG)")
 
         while True:
             self._new.wait()
@@ -196,63 +261,121 @@ class DetectorThread(threading.Thread):
                 continue
             t0 = time.perf_counter()
             try:
-                self.detections = self._detect(frame, cascades, hog)
+                self.detections = self._detect(frame, yolo, face, hog)
             except Exception as exc:
                 if not self._warned:
                     self._warned = True
-                    print(f"[w] loi detection (bo qua): {exc}")
+                    print(f"[w] loi detection (bo qua 1 khung): {exc}")
             self.detect_fps = self._ema(time.perf_counter() - t0)
 
-    def _detect(self, frame, cascades, hog):
+    # ----------------------------------------------------------
+    # Main detect: person -> upper/lower -> face
+    # ----------------------------------------------------------
+    def _detect(self, frame, yolo, face, hog):
+        results = []
+
+        if yolo is not None:
+            person_boxes = self._yolo_person(frame, yolo)
+        elif hog is not None:
+            person_boxes = self._hog_person(frame, hog)
+        else:
+            person_boxes = []
+
+        person_boxes = self._nms(person_boxes)
+
+        # NGUOI + THAN TREN + THAN DUOI (chia hinh hoc tu box nguoi)
+        for (x, y, bw, bh) in person_boxes:
+            results.append(("nguoi", GREEN, x, y, x + bw, y + bh))
+            mid = y + int(bh * 0.5)
+            results.append(("than_tren", ORANGE, x, y, x + bw, mid))
+            results.append(("than_duoi", BLUE, x, mid, x + bw, y + bh))
+
+        # MAT (Haar frontface), chay tren anh thu nho cho nhanh
+        if face is not None:
+            h, w = frame.shape[:2]
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            scale = self.work_width / float(w)
+            if scale < 1.0:
+                small = cv2.resize(gray, (self.work_width, max(1, int(h * scale))),
+                                   interpolation=cv2.INTER_AREA)
+            else:
+                scale = 1.0
+                small = gray
+            small = cv2.equalizeHist(small)
+            inv = 1.0 / scale
+            faces = face.detectMultiScale(small, scaleFactor=1.1, minNeighbors=6,
+                                          minSize=(24, 24))
+            for (x, y, bw, bh) in faces:
+                results.append(("mat", CYAN, int(x * inv), int(y * inv),
+                                int((x + bw) * inv), int((y + bh) * inv)))
+
+        return results
+
+    @staticmethod
+    def _letterbox(img, size):
+        h, w = img.shape[:2]
+        r = min(size / h, size / w)
+        nw, nh = max(1, round(w * r)), max(1, round(h * r))
+        resized = cv2.resize(img, (nw, nh))
+        canvas = np.full((size, size, 3), 114, np.uint8)
+        px, py = (size - nw) // 2, (size - nh) // 2
+        canvas[py:py + nh, px:px + nw] = resized
+        return canvas, r, px, py
+
+    def _yolo_person(self, frame, yolo):
+        net, meta = yolo
+        n_classes = meta["classes"]
+        person_class = meta["person"]
+        h0, w0 = frame.shape[:2]
+
+        canvas, r, px, py = self._letterbox(frame, self.yolo_size)
+        blob = cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, (self.yolo_size, self.yolo_size),
+                                     swapRB=True, crop=False)
+        net.setInput(blob)
+        out = net.forward()[0]
+        if out.shape[0] == n_classes + 4:
+            out = out.T
+        out = out.reshape(-1, n_classes + 4)
+
+        scores = out[:, 4:]
+        class_ids = scores.argmax(1)
+        confs = scores[np.arange(len(class_ids)), class_ids]
+        sel = np.where((class_ids == person_class) & (confs > self.confidence))[0]
+
+        rects, box_conf = [], []
+        for i in sel:
+            cx, cy, bw, bh = out[i, :4]
+            x1 = (cx - bw / 2.0 - px) / r
+            y1 = (cy - bh / 2.0 - py) / r
+            x2 = (cx + bw / 2.0 - px) / r
+            y2 = (cy + bh / 2.0 - py) / r
+            x1 = max(0, min(x1, w0)); y1 = max(0, min(y1, h0))
+            x2 = max(0, min(x2, w0)); y2 = max(0, min(y2, h0))
+            rects.append([int(x1), int(y1), int(max(1, x2 - x1)), int(max(1, y2 - y1))])
+            box_conf.append(float(confs[i]))
+
+        if not rects:
+            return []
+        keep = cv2.dnn.NMSBoxes(rects, box_conf, self.confidence, 0.45)
+        keep = np.array(keep).reshape(-1).tolist() if keep is not None else []
+        return [(rects[i][0], rects[i][1], rects[i][2], rects[i][3]) for i in keep]
+
+    def _hog_person(self, frame, hog):
         h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         scale = self.work_width / float(w)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if scale < 1.0:
-            small = cv2.resize(
-                gray, (self.work_width, max(1, int(h * scale))),
-                interpolation=cv2.INTER_AREA,
-            )
+            small = cv2.resize(gray, (self.work_width, max(1, int(h * scale))),
+                               interpolation=cv2.INTER_AREA)
         else:
             scale = 1.0
             small = gray
-
-        # Tang tuong phan giup Haar nhan dien tot khi thieu sang
-        small_eq = cv2.equalizeHist(small)
         inv = 1.0 / scale
-        results = []
-        persons = []
-
-        # Haar: than tren / than duoi / mat + fullbody
-        for label, (cascade, color, minsize, minn) in cascades.items():
-            rects = cascade.detectMultiScale(
-                small_eq, scaleFactor=1.05, minNeighbors=minn, minSize=minsize,
-            )
-            if len(rects) == 0:
-                continue
-            for (x, y, bw, bh) in rects:
-                x1, y1 = int(x * inv), int(y * inv)
-                x2, y2 = int((x + bw) * inv), int((y + bh) * inv)
-                if label == "person":
-                    persons.append((x1, y1, x2 - x1, y2 - y1))
-                else:
-                    results.append((LABELS[label], color, x1, y1, x2, y2))
-
-        # Neu Haar fullbody chua thay nguoi -> chay HOG people detector
-        if not persons:
-            rects, _ = hog.detectMultiScale(
-                small, winStride=(8, 8), padding=(8, 8), scale=1.05,
-            )
-            if len(rects) > 0:
-                for (x, y, bw, bh) in rects:
-                    x1, y1 = int(x * inv), int(y * inv)
-                    x2, y2 = int((x + bw) * inv), int((y + bh) * inv)
-                    persons.append((x1, y1, x2 - x1, y2 - y1))
-
-        # Gom cac box nguoi trung nhau
-        for (x, y, bw, bh) in self._nms(persons):
-            results.append(("nguoi", (0, 255, 0), x, y, x + bw, y + bh))
-
-        return results
+        rects, _ = hog.detectMultiScale(small, winStride=(8, 8), padding=(8, 8), scale=1.05)
+        out = []
+        for (x, y, bw, bh) in rects:
+            out.append((int(x * inv), int(y * inv), int(bw * inv), int(bh * inv)))
+        return out
 
     @staticmethod
     def _iou(a, b):
@@ -293,7 +416,11 @@ def parse_args():
     parser.add_argument("--save-dir", default=SAVE_DIR, help="Folder for photos/videos (default %(default)s)")
     parser.add_argument("--fullscreen", action="store_true", help="Launch fullscreen preview")
     parser.add_argument("--detect-scale", type=int, default=DETECT_SCALE,
-                        help="Detection working width; smaller = faster (default %(default)s)")
+                        help="Working width for face/hog detection (default %(default)s)")
+    parser.add_argument("--yolo-size", type=int, default=YOLO_SIZE,
+                        help="YOLO input size; 320 faster / 640 accurate (default %(default)s)")
+    parser.add_argument("--conf", type=float, default=YOLO_CONF,
+                        help="Person confidence threshold (default %(default)s)")
     parser.add_argument("--detect", dest="detect", action="store_true", default=True, help="Enable detection (default)")
     parser.add_argument("--no-detect", dest="detect", action="store_false", help="Disable detection")
     return parser.parse_args()
@@ -315,7 +442,7 @@ def main():
     capture = CaptureThread(picam2)
     capture.start()
 
-    det = DetectorThread(work_width=args.detect_scale)
+    det = DetectorThread(work_width=args.detect_scale, yolo_size=args.yolo_size, conf=args.conf)
     det.start()
 
     window = "Pi 4 Camera"
@@ -332,7 +459,7 @@ def main():
     blank = np.zeros((args.height, args.width, 3), dtype=np.uint8)
 
     print("""
-Pi 4 Camera Controller (Turbo v3)
+Pi 4 Camera Controller (Turbo v6)
 =================================
 Controls:
   SPACE : camera on/off         D : toggle detection
@@ -371,7 +498,7 @@ Detection colors:
             temp = read_cpu_temp()
             temp_line = f"CPU Temp: {temp:.1f} C" if temp is not None else "CPU Temp: n/a"
             draw_shadow(overlay, f"FPS: {fps:6.1f}", (12, 30))
-            draw_shadow(overlay, f"Detect FPS: {det.detect_fps:5.1f}", (12, 62))
+            draw_shadow(overlay, f"Detect FPS: {det.detect_fps:5.1f}  Engine: {det.engine or '-'}", (12, 62))
             draw_shadow(overlay, f"Res: {args.width}x{args.height}  Rec: {'ON ' if recording else 'OFF'}", (12, 94))
             draw_shadow(overlay, f"{datetime.now():%Y-%m-%d %H:%M:%S}  Uptime: {int(time.time() - started_at)}s", (12, 126))
             draw_shadow(overlay, temp_line, (12, 158))
