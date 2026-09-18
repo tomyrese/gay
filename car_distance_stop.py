@@ -25,9 +25,11 @@ BIN1_R = DigitalOutputDevice(23)   # Pin 16
 BIN2_R = DigitalOutputDevice(24)   # Pin 18
 
 # ==================== CẢM BIẾN SIÊU ÂM HC-SR04 (phía trước) ====================
-# Điều chỉnh chân theo đấu dây thực tế của bạn
-TRIG_PIN = 2    # GPIO2 - TRIG (chân ra)
-ECHO_PIN = 3    # GPIO3 - ECHO (chân vào)
+# LƯU Ý: không dùng GPIO2/GPIO3 vì 2 chân này có điện trở kéo lên vật lý
+# (không khớp với pull_up=False mặc định của DistanceSensor).
+# TRIG -> GPIO17 (chân 11), ECHO -> GPIO4 (chân 7)
+TRIG_PIN = 17   # GPIO17 - TRIG (chân ra)
+ECHO_PIN = 4    # GPIO4 - ECHO (chân vào)
 sensor = DistanceSensor(echo=ECHO_PIN, trigger=TRIG_PIN, max_distance=2.0)
 
 
