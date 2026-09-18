@@ -70,10 +70,25 @@ ORANGE = (0, 165, 255)
 BLUE = (255, 0, 0)
 CYAN = (255, 255, 0)
 
-MODEL_DIR = Path(__file__).resolve().parent / "models"
+SCRIPT_DIR = Path(__file__).resolve().parent
+MODEL_DIR = SCRIPT_DIR / "models"
 YOLO_ONNX = MODEL_DIR / "yolo11n.onnx"
+YOLO_ONNX_LOCAL = SCRIPT_DIR / "yolo11n.onnx"   # manh de dat model ngay canh script
 YOLO_URL = "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo11n.onnx"
 MIN_YOLO_BYTES = 5_000_000
+
+
+def ensure_model():
+    """Tim model co san (models/ hoac canh script); chi tai mang neu chua co.
+    Tra ve path hop le hoac None."""
+    for p in (YOLO_ONNX, YOLO_ONNX_LOCAL):
+        if p.exists() and p.stat().st_size > MIN_YOLO_BYTES:
+            return p
+
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    if not _download(YOLO_URL, YOLO_ONNX, needs_bytes=MIN_YOLO_BYTES):
+        return None
+    return YOLO_ONNX
 
 
 def read_cpu_temp():
@@ -105,15 +120,6 @@ def _download(url, dest, needs_bytes=0):
         except Exception as exc:
             print(f"[!] loi download: {exc}")
     return False
-
-
-def ensure_model():
-    """Tai YOLO11n.onnx ve neu chua co; tra ve path hoac None."""
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    if not (YOLO_ONNX.exists() and YOLO_ONNX.stat().st_size > MIN_YOLO_BYTES):
-        if not _download(YOLO_URL, YOLO_ONNX, needs_bytes=MIN_YOLO_BYTES):
-            return None
-    return YOLO_ONNX
 
 
 def load_yolo():
@@ -242,8 +248,14 @@ class DetectorThread(threading.Thread):
                         break
 
         # --- Tai YOLO11n tren nen (KHONG chan nha) ---
-        if not (YOLO_ONNX.exists() and YOLO_ONNX.stat().st_size > MIN_YOLO_BYTES):
-            print("[i] model YOLO11n chua co -> tai nen (xem log), van chay HOG...")
+        model_available = any(
+            p.exists() and p.stat().st_size > MIN_YOLO_BYTES
+            for p in (YOLO_ONNX, YOLO_ONNX_LOCAL)
+        )
+        if model_available:
+            print("[i] model YOLO11n co san -> dang nap engine...")
+        else:
+            print("[i] model YOLO11n chua co -> tai nen (xem log), van chay fallback...")
         loader = threading.Thread(target=self._load_yolo_bg, daemon=True)
         loader.start()
 
