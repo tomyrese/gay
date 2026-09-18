@@ -1,6 +1,6 @@
 import time
 from gpiozero import DigitalOutputDevice, PWMOutputDevice
-from gpiozero import DistanceSensor
+from gpiozero import OutputDevice, InputDevice
 
 PWM_FREQ = 1000
 
@@ -28,16 +28,37 @@ BIN2_R = DigitalOutputDevice(24)   # Pin 18
 # LƯU Ý: không dùng GPIO2/GPIO3 vì 2 chân này có điện trở kéo lên vật lý
 # (không khớp với pull_up=False mặc định của DistanceSensor).
 # TRIG -> GPIO17 (chân 11), ECHO -> GPIO4 (chân 7)
-TRIG_PIN = 17   # GPIO17 - TRIG (chân ra)
-ECHO_PIN = 4    # GPIO4 - ECHO (chân vào)
-sensor = DistanceSensor(echo=ECHO_PIN, trigger=TRIG_PIN, max_distance=2.0)
+# ECHO 5V nên đấu QUA CẦU PHÂN ÁP 1k-2k xuống 3.3V trước khi vào GPIO4.
+# Đọc theo cách thủ công (time.time) thay vì PWM mềm -> chuẩn & không bị
+# DistanceSensorNoEcho do timing không chính xác.
+TRIG_PIN = 17    # GPIO17 - TRIG (chân ra)
+ECHO_PIN = 4     # GPIO4 - ECHO (chân vào)
+
+trig = OutputDevice(TRIG_PIN)
+echo = InputDevice(ECHO_PIN, pull_up=False)
+SENSOR_TIMEOUT = 0.05   # 50ms không nhận echo thì xem như không có vật
 
 
 def do_khoang_cach():
-    try:
-        return sensor.distance * 100  # đơn vị cm
-    except Exception:
-        return 999.0
+    trig.off()
+    time.sleep(0.0002)
+
+    trig.on()
+    time.sleep(0.00001)   # xung TRIG 10µs
+    trig.off()
+
+    start = time.time()
+    while not echo.is_active:
+        if time.time() - start > SENSOR_TIMEOUT:
+            return 999.0   # không có echo
+
+    echo_start = time.time()
+    while echo.is_active:
+        if time.time() - echo_start > SENSOR_TIMEOUT:
+            return 999.0
+    echo_end = time.time()
+
+    return (echo_end - echo_start) * 34300.0 / 2.0   # đơn vị cm
 
 
 def drive_channel(in1, in2, pwm, speed):
