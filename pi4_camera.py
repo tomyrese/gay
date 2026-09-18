@@ -1,37 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Raspberry Pi 4 Camera Controller - Turbo v6
-===========================================
+Raspberry Pi 4 Camera Controller - Turbo v7 (toc do hoa)
+========================================================
 Live preview with FPS overlay + detection:
     - NGUOI      (full body)   -> YOLO11n (ONNX, OpenCV DNN)
     - THAN TREN  (upper body)  -> nua tren box nguoi
     - THAN DUOI  (lower body)  -> nua duoi box nguoi
     - MAT        (face)        -> Haar cascade (co san trong OpenCV)
 
-Vi sao lan nay CHAY DUOC:
-  * Person detection dung YOLO11n 10MB, COCO80 (person = class 0, chuan de hieu).
-    File ONNX tai tu ultralytics/assets GitHub Releases => download nguyen ven,
-    DA KIEM CHUNG chay that phat hien duoc nguoi (conf 0.90 tren anh chup).
-  * Chay bang cv2.dnn.readNetFromONNX => tuong thich OpenCV 4 va 5,
-    khong phu thuoc phien ban OpenCV nhu darknet/caffe truoc day.
-  * Neu luc dau gap loi do model cu (MobileNetSSD LFS hong, TFLite nhan bi lech,
-    darknet khong doc tren OpenCV moi) -> da loai bo toan bo, chi con ONNX.
-  * Face cascade tim theo nhieu duong dan he thong, khong crash khi thieu.
-  * Neu model tai ve loi -> tu dong fallback HOG people detector (built-in).
+Khac phuc "treo" va toi uu toc do:
+  * Model YOLO tai NEN (background) - khong bao gio chan khoi dong.
+    He thong chay HOG ngay lap tuc, tu nang cap len YOLO khi tai xong.
+  * YOLO input mac dinh 320 (nhanh cho Pi 4), dung --yolo-size 640 neu can chu xac.
+  * Capture YUV420 + capture thread + detection thread => display FPS con cao.
+  * Nen khong lay duoc model (mang cham) thi van chay duoc voi HOG.
 
 Cai dat tren Raspberry Pi 4 (lam 1 lan):
     pip3 install --upgrade opencv-python-headless picamera2 numpy
 
-Toi uu FPS:
-  * Capture native YUV420 -> BGR nhanh; capture thread + detection thread
-  * Detection chay trong thread rieng, display FPS KHONG giam
-  * --yolo-size 320 nhanh hon (mac dinh 640 chinh xac hon)
-
-Usage:
-    python3 pi4_camera.py
-    python3 pi4_camera.py --fps 90 --fullscreen
-    python3 pi4_camera.py --yolo-size 320 --conf 0.4
+Usage (kHUYEN DUNG cho Pi 4):
+    python3 pi4_camera.py --fast
+    python3 pi4_camera.py                              # mac dinh
+    python3 pi4_camera.py --yolo-size 640 --conf 0.4   # chat luong cao hon
 
 Controls:
     SPACE  : Bat / tat camera
@@ -61,11 +52,18 @@ HEIGHT = 720
 FPS = 60
 SAVE_DIR = "captures"
 FULLSCREEN = False
-DETECT_SCALE = 640    # do rong anh dung cho face / hog fallback
-YOLO_SIZE = 640       # input size cho YOLO11n (320 = nhanh hon)
+DETECT_SCALE = 480    # do rong anh dung cho face / hog fallback
+YOLO_SIZE = 320       # YOLO input: 320 nhanh (Pi4), 640 chinh xac hon
 YOLO_CONF = 0.5       # nguong tin cay person
 YOLO_CLASSES = 80     # COCO80
 PERSON_CLASS = 0      # COCO80: 0 = "person"
+
+# preset --fast
+FAST_WIDTH = 640
+FAST_HEIGHT = 480
+FAST_FPS = 60
+FAST_DETECT_SCALE = 480
+FAST_YOLO_SIZE = 320
 
 GREEN = (0, 255, 0)
 ORANGE = (0, 165, 255)
@@ -92,7 +90,7 @@ def _download(url, dest, needs_bytes=0):
         try:
             print(f"[*] tai {os.path.basename(str(dest))} (lan {attempt}/3) ...")
             req = urllib.request.Request(url, headers={"User-Agent": "curl/8.1"})
-            with urllib.request.urlopen(req, timeout=300) as resp, open(dest, "wb") as f:
+            with urllib.request.urlopen(req, timeout=90) as resp, open(dest, "wb") as f:
                 while True:
                     chunk = resp.read(8192)
                     if not chunk:
@@ -110,10 +108,9 @@ def _download(url, dest, needs_bytes=0):
 
 
 def ensure_model():
-    """Tai YOLO11n.onnx ve neu chua co; tra ve path."""
+    """Tai YOLO11n.onnx ve neu chua co; tra ve path hoac None."""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     if not (YOLO_ONNX.exists() and YOLO_ONNX.stat().st_size > MIN_YOLO_BYTES):
-        print("[i] can tai model YOLO11n (~10 MB), doi moi lat...")
         if not _download(YOLO_URL, YOLO_ONNX, needs_bytes=MIN_YOLO_BYTES):
             return None
     return YOLO_ONNX
@@ -189,12 +186,12 @@ class CaptureThread(threading.Thread):
 
 
 class DetectorThread(threading.Thread):
-    """Detection chay song song (YOLO11n + Haar), khong chan vong display."""
+    """Detection chay song song; tai YOLO nen khong chong khoi dong."""
 
     def __init__(self, work_width=DETECT_SCALE, yolo_size=YOLO_SIZE, conf=YOLO_CONF):
         super().__init__(daemon=True)
         self.work_width = max(work_width, 320)
-        self.yolo_size = max(yolo_size, 320)
+        self.yolo_size = max(yolo_size, 288)
         self.confidence = conf
         self._frame = None
         self._new = threading.Event()
@@ -203,8 +200,12 @@ class DetectorThread(threading.Thread):
         self.detect_fps = 0.0
         self.loaded = False
         self.error = None
-        self.engine = None   # "yolo11n" | "hog"
-        self._warned = False
+        self.yolo = None       # (net, meta) khi YOLO san sang
+        self.hog = None
+        self.person_cascade = None
+        self.face = None
+        self.engine = "loading"
+        self.once_warned = False
 
     def submit(self, frame):
         with self._lock:
@@ -213,39 +214,40 @@ class DetectorThread(threading.Thread):
 
     def run(self):
         # --- Face cascade (co san trong OpenCV) ---
-        face = None
         path = find_cascade("haarcascade_frontalface_default.xml")
         if path:
             fc = cv2.CascadeClassifier(path)
             if not fc.empty():
-                face = fc
+                self.face = fc
                 print("[*] face cascade: OK")
-            else:
-                print("[w] face cascade loi khi mo: bo qua mat")
         else:
             print("[w] khong tim thay face cascade: bo qua mat")
 
-        # --- Person engine: YOLO11n ONNX ---
-        yolo = None
+        # --- HOG fallback (built-in) dung ngay lap tuc ---
         try:
-            yolo = load_yolo()
-            self.engine = "yolo11n"
-            print("[*] person engine: YOLO11n (ONNX)")
+            self.hog = cv2.HOGDescriptor()
+            self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+            self.engine = "hog"
+            print("[i] engine tam thoi: HOG")
         except Exception as exc:
-            print(f"[!] khong dung duoc YOLO11n: {exc}")
+            print(f"[i] HOG khong co (OpenCV 5+ bo HOG?) -> dung Haar person: {exc}")
+            for cfile in ("haarcascade_fullbody.xml", "haarcascade_upperbody.xml"):
+                cpath = find_cascade(cfile)
+                if cpath:
+                    pc = cv2.CascadeClassifier(cpath)
+                    if not pc.empty():
+                        self.person_cascade = pc
+                        self.engine = "haar_person"
+                        print(f"[i] engine tam thoi: Haar ({cfile})")
+                        break
 
-        # --- Fallback: HOG people detector (built-in) ---
-        hog = None
-        if yolo is None:
-            try:
-                hog = cv2.HOGDescriptor()
-                hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-                self.engine = "hog"
-                print("[i] fallback: HOG people detector")
-            except Exception as exc:
-                print(f"[!] HOG cung loi: {exc}")
+        # --- Tai YOLO11n tren nen (KHONG chan nha) ---
+        if not (YOLO_ONNX.exists() and YOLO_ONNX.stat().st_size > MIN_YOLO_BYTES):
+            print("[i] model YOLO11n chua co -> tai nen (xem log), van chay HOG...")
+        loader = threading.Thread(target=self._load_yolo_bg, daemon=True)
+        loader.start()
 
-        if yolo is None and (face is None and hog is None):
+        if self.face is None and self.hog is None and self.person_cascade is None:
             self.error = "Khong co engine nhan dien nao hoat dong"
             print(f"[!] {self.error}")
             return
@@ -261,23 +263,34 @@ class DetectorThread(threading.Thread):
                 continue
             t0 = time.perf_counter()
             try:
-                self.detections = self._detect(frame, yolo, face, hog)
+                self.detections = self._detect(frame)
             except Exception as exc:
-                if not self._warned:
-                    self._warned = True
+                if not self.once_warned:
+                    self.once_warned = True
                     print(f"[w] loi detection (bo qua 1 khung): {exc}")
             self.detect_fps = self._ema(time.perf_counter() - t0)
+
+    def _load_yolo_bg(self):
+        try:
+            yolo = load_yolo()
+            self.yolo = yolo
+            self.engine = "yolo11n"
+            print("[*] YOLO11n san sang (engine da nang cap)")
+        except Exception as exc:
+            print(f"[!] khong dung duoc YOLO11n, giu engine hien tai: {exc}")
 
     # ----------------------------------------------------------
     # Main detect: person -> upper/lower -> face
     # ----------------------------------------------------------
-    def _detect(self, frame, yolo, face, hog):
+    def _detect(self, frame):
         results = []
 
-        if yolo is not None:
-            person_boxes = self._yolo_person(frame, yolo)
-        elif hog is not None:
-            person_boxes = self._hog_person(frame, hog)
+        if self.yolo is not None:
+            person_boxes = self._yolo_person(frame, self.yolo)
+        elif self.hog is not None:
+            person_boxes = self._hog_person(frame, self.hog)
+        elif self.person_cascade is not None:
+            person_boxes = self._cascade_person(frame, self.person_cascade)
         else:
             person_boxes = []
 
@@ -291,7 +304,7 @@ class DetectorThread(threading.Thread):
             results.append(("than_duoi", BLUE, x, mid, x + bw, y + bh))
 
         # MAT (Haar frontface), chay tren anh thu nho cho nhanh
-        if face is not None:
+        if self.face is not None:
             h, w = frame.shape[:2]
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             scale = self.work_width / float(w)
@@ -303,8 +316,8 @@ class DetectorThread(threading.Thread):
                 small = gray
             small = cv2.equalizeHist(small)
             inv = 1.0 / scale
-            faces = face.detectMultiScale(small, scaleFactor=1.1, minNeighbors=6,
-                                          minSize=(24, 24))
+            faces = self.face.detectMultiScale(small, scaleFactor=1.1, minNeighbors=6,
+                                               minSize=(24, 24))
             for (x, y, bw, bh) in faces:
                 results.append(("mat", CYAN, int(x * inv), int(y * inv),
                                 int((x + bw) * inv), int((y + bh) * inv)))
@@ -377,6 +390,23 @@ class DetectorThread(threading.Thread):
             out.append((int(x * inv), int(y * inv), int(bw * inv), int(bh * inv)))
         return out
 
+    def _cascade_person(self, frame, cascade):
+        h, w = frame.shape[:2]
+        scale = self.work_width / float(w)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if scale < 1.0:
+            small = cv2.resize(gray, (self.work_width, max(1, int(h * scale))),
+                               interpolation=cv2.INTER_AREA)
+        else:
+            scale = 1.0
+            small = gray
+        inv = 1.0 / scale
+        rects = cascade.detectMultiScale(small, scaleFactor=1.05, minNeighbors=3, minSize=(48, 96))
+        out = []
+        for (x, y, bw, bh) in rects:
+            out.append((int(x * inv), int(y * inv), int(bw * inv), int(bh * inv)))
+        return out
+
     @staticmethod
     def _iou(a, b):
         x1 = max(a[0], b[0])
@@ -410,15 +440,17 @@ def draw_shadow(overlay, text, pos, scale=0.6, color=(0, 255, 255), thickness=2)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Pi 4 camera + person/upper/lower/face detection + FPS overlay.")
-    parser.add_argument("--width", type=int, default=WIDTH, help="Capture width (default %(default)s)")
-    parser.add_argument("--height", type=int, default=HEIGHT, help="Capture height (default %(default)s)")
-    parser.add_argument("--fps", type=int, default=FPS, help="Desired camera framerate (default %(default)s)")
+    parser.add_argument("--fast", action="store_true",
+                        help="Preset toc do cao cho Pi 4: %(default)s")
+    parser.add_argument("--width", type=int, default=None, help="Capture width (default thay doi theo preset)")
+    parser.add_argument("--height", type=int, default=None, help="Capture height (default thay doi theo preset)")
+    parser.add_argument("--fps", type=int, default=None, help="Desired camera framerate (default thay doi theo preset)")
     parser.add_argument("--save-dir", default=SAVE_DIR, help="Folder for photos/videos (default %(default)s)")
     parser.add_argument("--fullscreen", action="store_true", help="Launch fullscreen preview")
-    parser.add_argument("--detect-scale", type=int, default=DETECT_SCALE,
-                        help="Working width for face/hog detection (default %(default)s)")
-    parser.add_argument("--yolo-size", type=int, default=YOLO_SIZE,
-                        help="YOLO input size; 320 faster / 640 accurate (default %(default)s)")
+    parser.add_argument("--detect-scale", type=int, default=None,
+                        help="Working width for face/hog detection (default thay doi theo preset)")
+    parser.add_argument("--yolo-size", type=int, default=None,
+                        help="YOLO input size; 320 fast / 640 accurate (default thay doi theo preset)")
     parser.add_argument("--conf", type=float, default=YOLO_CONF,
                         help="Person confidence threshold (default %(default)s)")
     parser.add_argument("--detect", dest="detect", action="store_true", default=True, help="Enable detection (default)")
@@ -427,22 +459,33 @@ def parse_args():
 
 
 def main():
+    cv2.setUseOptimized(True)
+
     args = parse_args()
+
+    fast = args.fast
+    width = args.width if args.width is not None else (FAST_WIDTH if fast else WIDTH)
+    height = args.height if args.height is not None else (FAST_HEIGHT if fast else HEIGHT)
+    fps = args.fps if args.fps is not None else (FAST_FPS if fast else FPS)
+    detect_scale = args.detect_scale if args.detect_scale is not None else (
+        FAST_DETECT_SCALE if fast else DETECT_SCALE)
+    yolo_size = args.yolo_size if args.yolo_size is not None else (
+        FAST_YOLO_SIZE if fast else YOLO_SIZE)
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     picam2 = Picamera2()
     config = picam2.create_video_configuration(
-        main={"size": (args.width, args.height), "format": "YUV420"},
-        controls={"FrameRate": args.fps},
+        main={"size": (width, height), "format": "YUV420"},
+        controls={"FrameRate": fps},
     )
     picam2.configure(config)
 
     capture = CaptureThread(picam2)
     capture.start()
 
-    det = DetectorThread(work_width=args.detect_scale, yolo_size=args.yolo_size, conf=args.conf)
+    det = DetectorThread(work_width=detect_scale, yolo_size=yolo_size, conf=args.conf)
     det.start()
 
     window = "Pi 4 Camera"
@@ -454,21 +497,20 @@ def main():
     detect_on = args.detect
     recording = False
     writer = None
-    fps = 0.0
+    fps_disp = 0.0
     started_at = time.time()
-    blank = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+    blank = np.zeros((height, width, 3), dtype=np.uint8)
 
-    print("""
-Pi 4 Camera Controller (Turbo v6)
+    print(f"""
+Pi 4 Camera Controller (Turbo v7)
 =================================
+Mode     : {'FAST (640x480, yolo 320)' if fast else 'default (1280x720, yolo 320)'}
 Controls:
   SPACE : camera on/off         D : toggle detection
   S     : take photo (JPG)      R : toggle video recording
   Q/ESC : quit
-
 Detection colors:
-  green  = nguoi       orange = than_tren
-  blue   = than_duoi   cyan   = mat
+  green=nguoi  orange=than_tren  blue=than_duoi  cyan=mat
 """)
 
     loop_t = time.perf_counter()
@@ -490,21 +532,24 @@ Detection colors:
                     writer = cv2.VideoWriter(
                         str(path),
                         cv2.VideoWriter_fourcc(*"MJPG"),
-                        args.fps, (args.width, args.height),
+                        fps, (width, height),
                     )
                     print(f"[*] recording -> {path}")
                 writer.write(overlay)
 
             temp = read_cpu_temp()
             temp_line = f"CPU Temp: {temp:.1f} C" if temp is not None else "CPU Temp: n/a"
-            draw_shadow(overlay, f"FPS: {fps:6.1f}", (12, 30))
-            draw_shadow(overlay, f"Detect FPS: {det.detect_fps:5.1f}  Engine: {det.engine or '-'}", (12, 62))
-            draw_shadow(overlay, f"Res: {args.width}x{args.height}  Rec: {'ON ' if recording else 'OFF'}", (12, 94))
+            draw_shadow(overlay, f"FPS: {fps_disp:6.1f}", (12, 30))
+            draw_shadow(overlay, f"Detect FPS: {det.detect_fps:5.1f}  Engine: {det.engine}", (12, 62))
+            draw_shadow(overlay, f"Res: {width}x{height}  Rec: {'ON ' if recording else 'OFF'}", (12, 94))
             draw_shadow(overlay, f"{datetime.now():%Y-%m-%d %H:%M:%S}  Uptime: {int(time.time() - started_at)}s", (12, 126))
             draw_shadow(overlay, temp_line, (12, 158))
 
             if detect_on:
                 if det.loaded:
+                    if det.yolo is None and det.engine not in ("loading",):
+                        draw_shadow(overlay, "dang tai YOLO ... (fallback tam thoi)", (12, 190),
+                                    scale=0.55, color=(0, 165, 255))
                     for label, color, x1, y1, x2, y2 in det.detections:
                         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
                         draw_shadow(overlay, label, (x1, max(y1 - 8, 20)),
@@ -524,7 +569,7 @@ Detection colors:
                 capture.set_running(False)
                 picam2.stop()
                 camera_on = False
-                fps = 0.0
+                fps_disp = 0.0
                 print("[i] camera stopped")
             else:
                 picam2.start()
@@ -549,7 +594,7 @@ Detection colors:
         elapsed = time.perf_counter() - loop_t
         if elapsed > 0:
             instant = 1.0 / elapsed
-            fps = instant if fps <= 0 else fps * 0.9 + instant * 0.1
+            fps_disp = instant if fps_disp <= 0 else fps_disp * 0.9 + instant * 0.1
         loop_t = time.perf_counter()
 
     if writer is not None:
