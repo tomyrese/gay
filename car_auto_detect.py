@@ -21,6 +21,7 @@ import argparse
 import time
 
 import cv2
+import numpy as np
 from picamera2 import Picamera2
 
 from pi4_camera import (
@@ -117,6 +118,8 @@ def main():
     last_distance = 999.0
 
     try:
+        blank = np.zeros((height, width, 3), dtype=np.uint8)
+
         while True:
             frame = capture.latest() if camera_on else None
 
@@ -154,7 +157,7 @@ def main():
                 draw_shadow(frame, f"Khoang cach: {distance:6.1f} cm   (dung < {STOP_DISTANCE_CM:.0f})",
                             (12, 94), scale=0.6)
                 draw_shadow(frame, f"Detect FPS: {det.detect_fps:5.1f}", (12, 126), scale=0.6)
-
+                overlay = frame
             else:
                 distance = do_khoang_cach()
                 last_distance = distance
@@ -163,9 +166,12 @@ def main():
                     dung()
                 else:
                     tien()
+                overlay = blank.copy()
+                draw_shadow(overlay, "CAMERA IS OFF - press C to start",
+                            (12, 40), scale=0.9, color=(0, 0, 255))
+                draw_shadow(overlay, "Q/ESC de thoat", (12, 90), scale=0.7)
 
-            if frame is not None:
-                cv2.imshow(window, frame)
+            cv2.imshow(window, overlay)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
