@@ -194,26 +194,35 @@ class CaptureThread(threading.Thread):
 class DetectorThread(threading.Thread):
     """Detection chay song song; tai YOLO nen khong chong khoi dong."""
 
-    def __init__(self, work_width=DETECT_SCALE, yolo_size=YOLO_SIZE, conf=YOLO_CONF):
+    def __init__(self, work_width=DETECT_SCALE, yolo_size=YOLO_SIZE, conf=YOLO_CONF,
+                 detect_fps=8.0, tight=0.9):
         super().__init__(daemon=True)
         self.work_width = max(work_width, 320)
         self.yolo_size = max(yolo_size, 288)
         self.confidence = conf
+        self.min_interval = 1.0 / max(detect_fps, 1.0)
+        self.tight = max(0.6, min(tight, 1.0))   # ty le giu chieu rong box (1.0 = box goc)
         self._frame = None
         self._new = threading.Event()
         self._lock = threading.Lock()
+        self._last_detect = 0.0
         self.detections = []  # list of (label, color, x1, y1, x2, y2)
         self.detect_fps = 0.0
+        self.person_count = 0
         self.loaded = False
         self.error = None
         self.yolo = None       # (net, meta) khi YOLO san sang
         self.hog = None
         self.person_cascade = None
         self.face = None
+        self.profile_face = None
         self.engine = "loading"
         self.once_warned = False
 
     def submit(self, frame):
+        now = time.perf_counter()
+        if now - self._last_detect < self.min_interval:
+            return   # throttle: khong spam engine giua cac lan detect
         with self._lock:
             self._frame = frame
         self._new.set()
@@ -254,24 +263,35 @@ class DetectorThread(threading.Thread):
                 if not self.once_warned:
                     self.once_warned = True
                     print(f"[w] loi detection (bo qua 1 khung): {exc}")
+            self._last_detect = time.perf_counter()
             self.detect_fps = self._ema(time.perf_counter() - t0)
 
     def _init_face(self):
         if not hasattr(cv2, "CascadeClassifier"):
             print("[i] cv2 thieu CascadeClassifier -> khong nhan dien mat")
             return
+        # Mat chinh dien
         path = find_cascade("haarcascade_frontalface_default.xml")
-        if not path:
-            print("[w] khong tim thay face cascade: bo qua mat")
-            return
-        try:
-            fc = cv2.CascadeClassifier(path)
-            if not fc.empty():
-                self.face = fc
-                print("[*] face cascade: OK")
-                return
-        except Exception as exc:
-            print(f"[!] loi load face cascade: {exc}")
+        if path:
+            try:
+                fc = cv2.CascadeClassifier(path)
+                if not fc.empty():
+                    self.face = fc
+                    print("[*] face cascade: OK")
+            except Exception as exc:
+                print(f"[!] loi load face cascade: {exc}")
+        # Mat nghien (profile) cho nhieu goc
+        prof = find_cascade("haarcascade_profileface.xml")
+        if prof:
+            try:
+                pc = cv2.CascadeClassifier(prof)
+                if not pc.empty():
+                    self.profile_face = pc
+                    print("[*] profile face cascade: OK")
+            except Exception as exc:
+                print(f"[i] loi load profile cascade: {exc}")
+        if self.face is None and self.profile_face is None:
+            print("[w] khong co face cascade => mat nghieng/chinh dien se khong hien")
 
     def _init_person_fallback(self):
         if hasattr(cv2, "HOGDescriptor") and hasattr(cv2, "HOGDescriptor_getDefaultPeopleDetector"):
@@ -324,6 +344,8 @@ class DetectorThread(threading.Thread):
             person_boxes = []
 
         person_boxes = self._nms(person_boxes)
+        person_boxes = self._tighten_boxes(person_boxes)
+        self.person_count = len(person_boxes)
 
         # NGUOI + THAN TREN + THAN DUOI (chia hinh hoc tu box nguoi)
         for (x, y, bw, bh) in person_boxes:
@@ -332,8 +354,8 @@ class DetectorThread(threading.Thread):
             results.append(("than_tren", ORANGE, x, y, x + bw, mid))
             results.append(("than_duoi", BLUE, x, mid, x + bw, y + bh))
 
-        # MAT (Haar frontface), chay tren anh thu nho cho nhanh
-        if self.face is not None:
+        # MAT: front + profile (dong thoi) tren anh thu nho cho nhanh
+        if self.face is not None or self.profile_face is not None:
             h, w = frame.shape[:2]
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             scale = self.work_width / float(w)
@@ -345,13 +367,49 @@ class DetectorThread(threading.Thread):
                 small = gray
             small = cv2.equalizeHist(small)
             inv = 1.0 / scale
-            faces = self.face.detectMultiScale(small, scaleFactor=1.1, minNeighbors=6,
-                                               minSize=(24, 24))
-            for (x, y, bw, bh) in faces:
-                results.append(("mat", CYAN, int(x * inv), int(y * inv),
+            face_boxes = []
+            if self.face is not None:
+                for (x, y, bw, bh) in self.face.detectMultiScale(
+                        small, scaleFactor=1.1, minNeighbors=6, minSize=(24, 24)):
+                    face_boxes.append((x, y, bw, bh, "mat"))
+            if self.profile_face is not None:
+                for (x, y, bw, bh) in self.profile_face.detectMultiScale(
+                        small, scaleFactor=1.1, minNeighbors=4, minSize=(24, 24)):
+                    face_boxes.append((x, y, bw, bh, "mat_goc"))
+            kept = self._box_nms(face_boxes, iou_thresh=0.5)
+            for (x, y, bw, bh, tag) in kept:
+                results.append((tag, CYAN, int(x * inv), int(y * inv),
                                 int((x + bw) * inv), int((y + bh) * inv)))
 
         return results
+
+    def _tighten_boxes(self, boxes):
+        """Khung YOLO thuong rong hon nguoi thuc (~do margin letterbox/resize).
+        Neu nguoi dung (b>w) thi bo loc chieu rong quanh tam; khong chay khi nam/che lieu."""
+        out = []
+        for (x, y, bw, bh) in boxes:
+            if bh >= bw * 1.2 and self.tight < 1.0:
+                keep_w = max(1, int(bw * self.tight))
+                dx = (bw - keep_w) // 2
+                out.append((x + dx, y, keep_w, bh))
+            else:
+                out.append((x, y, bw, bh))
+        return out
+
+    @staticmethod
+    def _box_nms(boxes, iou_thresh=0.5):
+        boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+        keep = []
+        for b in boxes:
+            bx = (b[0], b[1], b[2], b[3])
+            if all(DetectorThread._iou(bx, DetectorThread._box_of(k)) < iou_thresh
+                   for k in keep):
+                keep.append(b)
+        return keep
+
+    @staticmethod
+    def _box_of(b):
+        return (b[0], b[1], b[2], b[3])
 
     @staticmethod
     def _letterbox(img, size):
@@ -482,6 +540,10 @@ def parse_args():
                         help="YOLO input size; 320 fast / 640 accurate (default thay doi theo preset)")
     parser.add_argument("--conf", type=float, default=YOLO_CONF,
                         help="Person confidence threshold (default %(default)s)")
+    parser.add_argument("--detect-fps", type=float, default=8.0,
+                        help="Max detection passes per second (default %(default)s; giam neu CPU norm noi)")
+    parser.add_argument("--tight", type=float, default=0.9,
+                        help="Giu ty le chieu rong box nguoi sau khi siet (1.0 = box goc, 0.8 = sgiet hơn)")
     parser.add_argument("--detect", dest="detect", action="store_true", default=True, help="Enable detection (default)")
     parser.add_argument("--no-detect", dest="detect", action="store_false", help="Disable detection")
     return parser.parse_args()
@@ -514,7 +576,8 @@ def main():
     capture = CaptureThread(picam2)
     capture.start()
 
-    det = DetectorThread(work_width=detect_scale, yolo_size=yolo_size, conf=args.conf)
+    det = DetectorThread(work_width=detect_scale, yolo_size=yolo_size, conf=args.conf,
+                         detect_fps=args.detect_fps, tight=args.tight)
     det.start()
 
     window = "Pi 4 Camera"
@@ -539,7 +602,9 @@ Controls:
   S     : take photo (JPG)      R : toggle video recording
   Q/ESC : quit
 Detection colors:
-  green=nguoi  orange=than_tren  blue=than_duoi  cyan=mat
+  green=nguoi  orange=than_tren  blue=than_duoi  cyan=mat (mat_goc khi nghien)
+Tunning: --tight 0.8 (siet box)  --conf 0.4 (nhan nguoi xa/nho)
+         --detect-fps 5 (CPU nhe hon)  --yolo-size 640 (chinh xac hon)
 """)
 
     loop_t = time.perf_counter()
@@ -569,7 +634,8 @@ Detection colors:
             temp = read_cpu_temp()
             temp_line = f"CPU Temp: {temp:.1f} C" if temp is not None else "CPU Temp: n/a"
             draw_shadow(overlay, f"FPS: {fps_disp:6.1f}", (12, 30))
-            draw_shadow(overlay, f"Detect FPS: {det.detect_fps:5.1f}  Engine: {det.engine}", (12, 62))
+            draw_shadow(overlay, f"Detect FPS: {det.detect_fps:5.1f}  Engine: {det.engine}  Nguoi: {det.person_count}",
+                        (12, 62))
             draw_shadow(overlay, f"Res: {width}x{height}  Rec: {'ON ' if recording else 'OFF'}", (12, 94))
             draw_shadow(overlay, f"{datetime.now():%Y-%m-%d %H:%M:%S}  Uptime: {int(time.time() - started_at)}s", (12, 126))
             draw_shadow(overlay, temp_line, (12, 158))
@@ -580,7 +646,8 @@ Detection colors:
                         draw_shadow(overlay, "dang tai YOLO ... (fallback tam thoi)", (12, 190),
                                     scale=0.55, color=(0, 165, 255))
                     for label, color, x1, y1, x2, y2 in det.detections:
-                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+                        thickness = 2 if label == "nguoi" else 1
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness)
                         draw_shadow(overlay, label, (x1, max(y1 - 8, 20)),
                                     scale=0.55, color=color, thickness=1)
                 elif det.error:
