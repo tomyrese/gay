@@ -41,10 +41,17 @@ from pi4_camera import (
 )
 from car_distance_stop import (
     tien,
+    lui,
+    quay_trai,
+    quay_phai,
     dung,
     do_khoang_cach,
     STBY_L,
     STBY_R,
+    PWMA_L,
+    PWMB_L,
+    PWMA_R,
+    PWMB_R,
     STOP_DISTANCE_CM,
     SAFE_DISTANCE_CM,
 )
@@ -77,7 +84,39 @@ def parse_args():
     parser.add_argument("--fast", action="store_true", help="640x480 cho Pi 4")
     parser.add_argument("--conf", type=float, default=0.5, help="Nguong tin cay person")
     parser.add_argument("--detect-fps", type=float, default=8.0, help="Lan detect moi giay")
+    parser.add_argument("--speed", type=float, default=0.35,
+                        help="Toc do xe 0..1 (mac dinh %(default)s; tang len neu xe khong di)")
+    parser.add_argument("--motor-test", action="store_true",
+                        help="Chay tu dong tien/lui/quay de kiem tra dong co, khong dung detection")
     return parser.parse_args()
+
+
+def motor_test(speed):
+    print(f">>> Motor test (speed={speed}): TIEN 1s ...")
+    tien(speed)
+    time.sleep(1)
+    dung()
+    time.sleep(0.5)
+    print(f">>> Motor test: LUI 1s ...")
+    lui(speed)
+    time.sleep(1)
+    dung()
+    time.sleep(0.5)
+    print(f">>> Motor test: QUAY TRAI 0.8s ...")
+    quay_trai(speed)
+    time.sleep(0.8)
+    dung()
+    time.sleep(0.5)
+    print(f">>> Motor test: QUAY PHAI 0.8s ...")
+    quay_phai(speed)
+    time.sleep(0.8)
+    dung()
+    print(">>> Motor test xong (neu xe khong di => loi dau day / nguon / TB6612)")
+
+
+def motor_state_text():
+    return (f"Motor L: {max(PWMA_L.value, PWMB_L.value):.2f}   "
+            f"R: {max(PWMA_R.value, PWMB_R.value):.2f}")
 
 
 def main():
@@ -112,6 +151,15 @@ def main():
     STBY_R.on()
     print("TB6612 san sang. Nhan C de bat/tat camera, Q de thoat.")
 
+    if args.motor_test:
+        try:
+            motor_test(args.speed)
+        finally:
+            dung()
+            STBY_L.off()
+            STBY_R.off()
+        return
+
     camera_on = False
     blocked_until = 0.0
     n_loop = 0
@@ -139,10 +187,10 @@ def main():
 
                 if now < blocked_until:
                     dung()
-                    state = "DUNG (co nguoi/vat)"
+                    state = "DUNG vi co nguoi/vat truoc"
                 else:
-                    tien()
-                    state = "CHAY"
+                    tien(args.speed)
+                    state = f"CHAY (speed {args.speed})"
 
                 # Ve box + thong tin len anh
                 for label, color, x1, y1, x2, y2 in det.detections:
@@ -157,6 +205,7 @@ def main():
                 draw_shadow(frame, f"Khoang cach: {distance:6.1f} cm   (dung < {STOP_DISTANCE_CM:.0f})",
                             (12, 94), scale=0.6)
                 draw_shadow(frame, f"Detect FPS: {det.detect_fps:5.1f}", (12, 126), scale=0.6)
+                draw_shadow(frame, motor_state_text(), (12, 158), scale=0.6)
                 overlay = frame
             else:
                 distance = do_khoang_cach()
@@ -165,11 +214,12 @@ def main():
                 if distance < STOP_DISTANCE_CM:
                     dung()
                 else:
-                    tien()
+                    tien(args.speed)
                 overlay = blank.copy()
                 draw_shadow(overlay, "CAMERA IS OFF - press C to start",
                             (12, 40), scale=0.9, color=(0, 0, 255))
-                draw_shadow(overlay, "Q/ESC de thoat", (12, 90), scale=0.7)
+                draw_shadow(overlay, motor_state_text(), (12, 90), scale=0.7)
+                draw_shadow(overlay, "Q/ESC de thoat", (12, 130), scale=0.7)
 
             cv2.imshow(window, overlay)
             key = cv2.waitKey(1) & 0xFF
