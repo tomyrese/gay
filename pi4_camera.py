@@ -3,29 +3,32 @@
 """
 Raspberry Pi 4 Camera Controller - Turbo Edition
 ================================================
-Live preview with FPS overlay + real-time person detection
-(MobileNet-SSD chay tren OpenCV DNN).
+Live preview with FPS overlay + multi-class detection:
+    - NGUOI (full body)
+    - THAN TREN (upper body)
+    - THAN DUOI (lower body)
+    - MAT (face)
+
+Detection dung Haar cascades CO SAN trong OpenCV
+(cv2.data.haarcascades) -> KHONG can tai model, chay duoc ngay.
 
 Toi uu tang FPS:
   * Capture native YUV420 -> chuyen doi BGR bang OpenCV (nhanh hon RGB888)
   * Thread rieng doc frame tu camera (vong display khong cho sensor)
-  * Person detection chay trong thread rieng -> KHONG lam giam FPS hien thi
-  * Detection chi tinh tren blob 300x300, chi ve hop len man hinh
+  * Detection chay trong thread rieng -> KHONG lam giam FPS hien thi
+  * Detection tinh tren anh thu nho (--detect-scale) roi scale box ve man hinh
 
 Usage:
     python3 pi4_camera.py
     python3 pi4_camera.py --width 640 --height 480 --fps 90 --fullscreen
-    python3 pi4_camera.py --fps 90 --detect-threshold 0.4
+    python3 pi4_camera.py --detect-scale 640 --fps 90
 
 Controls (bam phim khi cua so preview dang mo):
     SPACE  : Bat / tat camera
-    D      : Bat / tat person detection
+    D      : Bat / tat detection
     S      : Chup anh (luu thanh JPG)
     R      : Bat / tat quay video (luu thanh AVI)
     Q/ESC  : Thoat
-
-Model (tu dong tai ve lan dau vao thu muc models/ ~23 MB):
-    MobileNetSSD_deploy.prototxt + MobileNetSSD_deploy.caffemodel
 
 Requirements (tren Raspberry Pi 4):
     pip3 install opencv-python-headless picamera2 numpy
@@ -33,10 +36,9 @@ Requirements (tren Raspberry Pi 4):
 """
 
 import argparse
-import shutil
+import os
 import threading
 import time
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -52,21 +54,15 @@ HEIGHT = 720
 FPS = 60
 SAVE_DIR = "captures"
 FULLSCREEN = False
-DETECT_THRESHOLD = 0.45
-PERSON_CLASS_ID = 15  # COCO / VOC: person
+DETECT_SCALE = 960  # do rong anh dung de detect (nho = nhanh hon)
 
-MODEL_DIR = Path(__file__).resolve().parent / "models"
-PROTO = MODEL_DIR / "MobileNetSSD_deploy.prototxt"
-CAFFE = MODEL_DIR / "MobileNetSSD_deploy.caffemodel"
-
-PROTO_URLS = [
-    "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/MobileNetSSD_deploy.prototxt",
-    "https://raw.githubusercontent.com/djmv/MobilNet_SSD_opencv/master/MobileNetSSD_deploy.prototxt",
-]
-CAFFE_URLS = [
-    "https://github.com/chuanqi305/MobileNet-SSD/raw/master/VGG/VOC0712/MobileNetSSD_deploy.caffemodel",
-    "https://github.com/djmv/MobilNet_SSD_opencv/raw/master/MobileNetSSD_deploy.caffemodel",
-]
+# (file cascade, mau BGR, minSize tren anh detect, minNeighbors)
+CASCADES = {
+    "person": ("haarcascade_fullbody.xml", (0, 255, 0), (60, 110), 4),
+    "upper": ("haarcascade_upperbody.xml", (0, 165, 255), (50, 65), 4),
+    "lower": ("haarcascade_lowerbody.xml", (255, 0, 0), (50, 65), 4),
+    "face": ("haarcascade_frontalface_default.xml", (255, 255, 0), (26, 26), 6),
+}
 
 
 def read_cpu_temp():
@@ -76,36 +72,6 @@ def read_cpu_temp():
         return int(raw) / 1000.0
     except (OSError, ValueError, IOError):
         return None
-
-
-def _download(url, dest):
-    print(f"[*] downloading {url}")
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "curl/8.1"})
-        with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
-            shutil.copyfileobj(resp, f)
-        return dest.stat().st_size > 1000
-    except Exception as exc:
-        print(f"[!] download failed: {exc}")
-        return False
-
-
-def ensure_model():
-    """Tai model MobileNet-SSD ve neu chua co."""
-    if PROTO.exists() and CAFFE.exists() and CAFFE.stat().st_size > 1_500_000:
-        return PROTO, CAFFE
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    if not PROTO.exists():
-        for url in PROTO_URLS:
-            if _download(url, PROTO):
-                break
-    if not CAFFE.exists():
-        for url in CAFFE_URLS:
-            if _download(url, CAFFE):
-                break
-    if not (PROTO.exists() and CAFFE.exists()):
-        raise RuntimeError("Khong tai duoc model MobileNet-SSD, dung --no-detect de tat.")
-    return PROTO, CAFFE
 
 
 class CaptureThread(threading.Thread):
@@ -144,15 +110,15 @@ class CaptureThread(threading.Thread):
 
 
 class DetectorThread(threading.Thread):
-    """Nhan dien nguoi chay nend song song, khong chan vong display."""
+    """Detect nguoi / than tren / than duoi / mat chay song song."""
 
-    def __init__(self, confidence=DETECT_THRESHOLD):
+    def __init__(self, work_width=DETECT_SCALE):
         super().__init__(daemon=True)
-        self.confidence = confidence
+        self.work_width = work_width
         self._frame = None
         self._new = threading.Event()
         self._lock = threading.Lock()
-        self.detections = []
+        self.detections = []  # list of (label, color, x1, y1, x2, y2)
         self.detect_fps = 0.0
         self.loaded = False
         self.error = None
@@ -163,15 +129,17 @@ class DetectorThread(threading.Thread):
         self._new.set()
 
     def run(self):
-        try:
-            proto, caffemodel = ensure_model()
-            net = cv2.dnn.readNetFromCaffe(str(proto), str(caffemodel))
-            self.loaded = True
-            print("[*] person detector ready (MobileNet-SSD)")
-        except Exception as exc:
-            self.error = str(exc)
-            print(f"[!] detector unavailable: {exc}")
-            return
+        cascades = {}
+        for label, (fname, color, minsize, minn) in CASCADES.items():
+            path = os.path.join(cv2.data.haarcascades, fname)
+            cascade = cv2.CascadeClassifier(path)
+            if cascade.empty():
+                self.error = f"Khong the tai classifier: {path}"
+                print(f"[!] {self.error}")
+                return
+            cascades[label] = (cascade, color, minsize, minn)
+        self.loaded = True
+        print("[*] detector ready: person / upper / lower / face (Haar)")
 
         while True:
             self._new.wait()
@@ -180,34 +148,38 @@ class DetectorThread(threading.Thread):
                 frame = self._frame
             if frame is None:
                 continue
-            h, w = frame.shape[:2]
-            if h == 0 or w == 0:
-                continue
-
             t0 = time.perf_counter()
-            blob = cv2.dnn.blobFromImage(frame, 0.007843, (300, 300), 127.5)
-            net.setInput(blob)
-            out = net.forward()
-
-            rects, scores, found = [], [], []
-            for i in range(out.shape[2]):
-                conf = float(out[0, 0, i, 2])
-                if conf < self.confidence:
-                    continue
-                if int(out[0, 0, i, 1]) != PERSON_CLASS_ID:
-                    continue
-                x1 = int(np.clip(out[0, 0, i, 3] * w, 0, w))
-                y1 = int(np.clip(out[0, 0, i, 4] * h, 0, h))
-                x2 = int(np.clip(out[0, 0, i, 5] * w, 0, w))
-                y2 = int(np.clip(out[0, 0, i, 6] * h, 0, h))
-                rects.append([x1, y1, x2 - x1, y2 - y1])
-                scores.append(conf)
-                found.append(("person", conf, x1, y1, x2, y2))
-
-            keep = cv2.dnn.NMSBoxes(rects, scores, self.confidence, 0.4)
-            keep = np.array(keep).reshape(-1).tolist() if keep is not None else []
-            self.detections = [found[i] for i in keep]
+            self.detections = self._detect(frame, cascades)
             self.detect_fps = self._ema(time.perf_counter() - t0)
+
+    def _detect(self, frame, cascades):
+        h, w = frame.shape[:2]
+        scale = self.work_width / float(w)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if scale < 1.0:
+            small = cv2.resize(
+                gray, (self.work_width, max(1, int(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            scale = 1.0
+            small = gray
+
+        results = []
+        inv = 1.0 / scale
+        for label, (cascade, color, minsize, minn) in cascades.items():
+            rects = cascade.detectMultiScale(
+                small, scaleFactor=1.1, minNeighbors=minn, minSize=minsize,
+            )
+            if len(rects) == 0:
+                continue
+            for (x, y, bw, bh) in rects:
+                x1 = int(x * inv)
+                y1 = int(y * inv)
+                x2 = int((x + bw) * inv)
+                y2 = int((y + bh) * inv)
+                results.append((label, color, x1, y1, x2, y2))
+        return results
 
     def _ema(self, elapsed):
         instant = 1.0 / elapsed if elapsed > 0 else 0.0
@@ -221,16 +193,16 @@ def draw_shadow(overlay, text, pos, scale=0.6, color=(0, 255, 255), thickness=2)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Pi 4 camera + person detection + FPS overlay.")
+    parser = argparse.ArgumentParser(description="Pi 4 camera + person/upper/lower/face detection + FPS overlay.")
     parser.add_argument("--width", type=int, default=WIDTH, help="Capture width (default %(default)s)")
     parser.add_argument("--height", type=int, default=HEIGHT, help="Capture height (default %(default)s)")
     parser.add_argument("--fps", type=int, default=FPS, help="Desired camera framerate (default %(default)s)")
     parser.add_argument("--save-dir", default=SAVE_DIR, help="Folder for photos/videos (default %(default)s)")
     parser.add_argument("--fullscreen", action="store_true", help="Launch fullscreen preview")
-    parser.add_argument("--detect", dest="detect", action="store_true", default=True, help="Enable person detection (default)")
-    parser.add_argument("--no-detect", dest="detect", action="store_false", help="Disable person detection")
-    parser.add_argument("--detect-threshold", type=float, default=DETECT_THRESHOLD,
-                        help="Detection confidence threshold (default %(default)s)")
+    parser.add_argument("--detect-scale", type=int, default=DETECT_SCALE,
+                        help="Detection working width; smaller = faster (default %(default)s)")
+    parser.add_argument("--detect", dest="detect", action="store_true", default=True, help="Enable detection (default)")
+    parser.add_argument("--no-detect", dest="detect", action="store_false", help="Disable detection")
     return parser.parse_args()
 
 
@@ -250,7 +222,7 @@ def main():
     capture = CaptureThread(picam2)
     capture.start()
 
-    det = DetectorThread(confidence=args.detect_threshold)
+    det = DetectorThread(work_width=args.detect_scale)
     det.start()
 
     window = "Pi 4 Camera"
@@ -270,9 +242,13 @@ def main():
 Pi 4 Camera Controller (Turbo)
 ==============================
 Controls:
-  SPACE : camera on/off         D : toggle person detection
+  SPACE : camera on/off         D : toggle detection
   S     : take photo (JPG)      R : toggle video recording
   Q/ESC : quit
+
+Detection colors:
+  green  = person      orange = upper body
+  blue   = lower body  cyan   = face
 """)
 
     loop_t = time.perf_counter()
@@ -309,10 +285,10 @@ Controls:
 
             if detect_on:
                 if det.loaded:
-                    for label, conf, x1, y1, x2, y2 in det.detections:
-                        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        draw_shadow(overlay, f"{label} {conf:.2f}", (x1, max(y1 - 8, 20)),
-                                    scale=0.55, color=(0, 255, 0), thickness=1)
+                    for label, color, x1, y1, x2, y2 in det.detections:
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+                        draw_shadow(overlay, label, (x1, max(y1 - 8, 20)),
+                                    scale=0.55, color=color, thickness=1)
                 elif det.error:
                     draw_shadow(overlay, "Detector: unavailable", (12, 190), color=(0, 0, 255))
             else:
@@ -337,7 +313,7 @@ Controls:
                 print("[i] camera started")
         elif key == ord("d"):
             detect_on = not detect_on
-            print(f"[i] person detection: {'ON' if detect_on else 'OFF'}")
+            print(f"[i] detection: {'ON' if detect_on else 'OFF'}")
         elif key == ord("s") and camera_on:
             path = save_dir / f"photo_{datetime.now():%Y%m%d_%H%M%S}.jpg"
             cv2.imwrite(str(path), capture.latest())
