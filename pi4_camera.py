@@ -132,8 +132,8 @@ def load_yolo():
 
 
 def cascade_candidates():
-    """Gom cac duong dan toi thu muc haarcascades co the co."""
-    dirs = []
+    """Cac noi tim haarcascade: uu tien thu muc cascades/ canh script, roi thu vien."""
+    dirs = [str(SCRIPT_DIR / "cascades")]
     try:
         dirs.append(cv2.data.haarcascades)
     except AttributeError:
@@ -219,33 +219,8 @@ class DetectorThread(threading.Thread):
         self._new.set()
 
     def run(self):
-        # --- Face cascade (co san trong OpenCV) ---
-        path = find_cascade("haarcascade_frontalface_default.xml")
-        if path:
-            fc = cv2.CascadeClassifier(path)
-            if not fc.empty():
-                self.face = fc
-                print("[*] face cascade: OK")
-        else:
-            print("[w] khong tim thay face cascade: bo qua mat")
-
-        # --- HOG fallback (built-in) dung ngay lap tuc ---
-        try:
-            self.hog = cv2.HOGDescriptor()
-            self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-            self.engine = "hog"
-            print("[i] engine tam thoi: HOG")
-        except Exception as exc:
-            print(f"[i] HOG khong co (OpenCV 5+ bo HOG?) -> dung Haar person: {exc}")
-            for cfile in ("haarcascade_fullbody.xml", "haarcascade_upperbody.xml"):
-                cpath = find_cascade(cfile)
-                if cpath:
-                    pc = cv2.CascadeClassifier(cpath)
-                    if not pc.empty():
-                        self.person_cascade = pc
-                        self.engine = "haar_person"
-                        print(f"[i] engine tam thoi: Haar ({cfile})")
-                        break
+        self._init_face()
+        self._init_person_fallback()
 
         # --- Tai YOLO11n tren nen (KHONG chan nha) ---
         model_available = any(
@@ -259,10 +234,9 @@ class DetectorThread(threading.Thread):
         loader = threading.Thread(target=self._load_yolo_bg, daemon=True)
         loader.start()
 
-        if self.face is None and self.hog is None and self.person_cascade is None:
-            self.error = "Khong co engine nhan dien nao hoat dong"
-            print(f"[!] {self.error}")
-            return
+        if (self.face is None and self.hog is None
+                and self.person_cascade is None and not model_available):
+            print("[!] chua co engine nao san sang - doi YOLO tai nen...")
 
         self.loaded = True
 
@@ -281,6 +255,49 @@ class DetectorThread(threading.Thread):
                     self.once_warned = True
                     print(f"[w] loi detection (bo qua 1 khung): {exc}")
             self.detect_fps = self._ema(time.perf_counter() - t0)
+
+    def _init_face(self):
+        if not hasattr(cv2, "CascadeClassifier"):
+            print("[i] cv2 thieu CascadeClassifier -> khong nhan dien mat")
+            return
+        path = find_cascade("haarcascade_frontalface_default.xml")
+        if not path:
+            print("[w] khong tim thay face cascade: bo qua mat")
+            return
+        try:
+            fc = cv2.CascadeClassifier(path)
+            if not fc.empty():
+                self.face = fc
+                print("[*] face cascade: OK")
+                return
+        except Exception as exc:
+            print(f"[!] loi load face cascade: {exc}")
+
+    def _init_person_fallback(self):
+        if hasattr(cv2, "HOGDescriptor") and hasattr(cv2, "HOGDescriptor_getDefaultPeopleDetector"):
+            try:
+                hog = cv2.HOGDescriptor()
+                hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+                self.hog = hog
+                self.engine = "hog"
+                print("[i] engine tam thoi: HOG")
+                return
+            except Exception as exc:
+                print(f"[i] HOG loi: {exc}")
+        if hasattr(cv2, "CascadeClassifier"):
+            for cfile in ("haarcascade_fullbody.xml", "haarcascade_upperbody.xml"):
+                cpath = find_cascade(cfile)
+                if cpath:
+                    try:
+                        pc = cv2.CascadeClassifier(cpath)
+                        if not pc.empty():
+                            self.person_cascade = pc
+                            self.engine = "haar_person"
+                            print(f"[i] engine tam thoi: Haar ({cfile})")
+                            return
+                    except Exception as exc:
+                        print(f"[i] loi load {cfile}: {exc}")
+        print("[i] khong co fallback HOG/Haar; chi con YOLO (engine chinh)")
 
     def _load_yolo_bg(self):
         try:
