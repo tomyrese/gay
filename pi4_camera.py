@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Raspberry Pi 4 Camera Controller - Turbo Edition
-================================================
+Raspberry Pi 4 Camera Controller - Turbo Edition v3
+===================================================
 Live preview with FPS overlay + multi-class detection:
-    - NGUOI (full body)
-    - THAN TREN (upper body)
-    - THAN DUOI (lower body)
-    - MAT (face)
+    - NGUOI      (full body, engine: HOG + Haar fullbody)
+    - THAN TREN  (upper body, Haar)
+    - THAN DUOI  (lower body, Haar)
+    - MAT        (face, Haar)
 
-Detection dung Haar cascades CO SAN trong OpenCV
-(cv2.data.haarcascades) -> KHONG can tai model, chay duoc ngay.
+Detection dung phan mem CO SAN trong OpenCV (khong tai model):
+  * HOG people detector      -> bat nguoi chinh xac
+  * Haar cascades (cv2.data) -> than tren / than duoi / mat
+  * Cascade path co fallback nhieu duong dan, khong crash khi thieu file
+  * equalizeHist giup Haar nhan dien tot ca khi thieu sang
 
-Toi uu tang FPS:
-  * Capture native YUV420 -> chuyen doi BGR bang OpenCV (nhanh hon RGB888)
-  * Thread rieng doc frame tu camera (vong display khong cho sensor)
-  * Detection chay trong thread rieng -> KHONG lam giam FPS hien thi
+Toi uu FPS:
+  * Capture native YUV420 -> chuyen doi BGR nhanh
+  * Capture thread + detection thread -> vong display khong bi chan
   * Detection tinh tren anh thu nho (--detect-scale) roi scale box ve man hinh
 
 Usage:
     python3 pi4_camera.py
     python3 pi4_camera.py --width 640 --height 480 --fps 90 --fullscreen
-    python3 pi4_camera.py --detect-scale 640 --fps 90
+    python3 pi4_camera.py --detect-scale 480
 
-Controls (bam phim khi cua so preview dang mo):
+Controls:
     SPACE  : Bat / tat camera
     D      : Bat / tat detection
-    S      : Chup anh (luu thanh JPG)
-    R      : Bat / tat quay video (luu thanh AVI)
+    S      : Chup anh (JPG)
+    R      : Bat / tat quay video (AVI)
     Q/ESC  : Thoat
-
-Requirements (tren Raspberry Pi 4):
-    pip3 install opencv-python-headless picamera2 numpy
-    Chu y: picamera2 da co san trong Raspberry Pi OS Bookworm.
 """
 
 import argparse
@@ -54,14 +52,22 @@ HEIGHT = 720
 FPS = 60
 SAVE_DIR = "captures"
 FULLSCREEN = False
-DETECT_SCALE = 960  # do rong anh dung de detect (nho = nhanh hon)
+DETECT_SCALE = 640  # do rong anh dung de detect (nho = nhanh hon)
 
 # (file cascade, mau BGR, minSize tren anh detect, minNeighbors)
 CASCADES = {
-    "person": ("haarcascade_fullbody.xml", (0, 255, 0), (60, 110), 4),
-    "upper": ("haarcascade_upperbody.xml", (0, 165, 255), (50, 65), 4),
-    "lower": ("haarcascade_lowerbody.xml", (255, 0, 0), (50, 65), 4),
-    "face": ("haarcascade_frontalface_default.xml", (255, 255, 0), (26, 26), 6),
+    "person": ("haarcascade_fullbody.xml", (0, 255, 0), (40, 80), 4),
+    "upper": ("haarcascade_upperbody.xml", (0, 165, 255), (40, 50), 4),
+    "lower": ("haarcascade_lowerbody.xml", (255, 0, 0), (40, 50), 4),
+    "face": ("haarcascade_frontalface_default.xml", (255, 255, 0), (22, 22), 5),
+}
+
+# Ten hien thi cho tung lop
+LABELS = {
+    "person": "nguoi",
+    "upper": "than_tren",
+    "lower": "than_duoi",
+    "face": "mat",
 }
 
 
@@ -72,6 +78,32 @@ def read_cpu_temp():
         return int(raw) / 1000.0
     except (OSError, ValueError, IOError):
         return None
+
+
+def cascade_candidates():
+    """Gom cac duong dan toi thu muc haarcascades co the co."""
+    dirs = []
+    try:
+        dirs.append(cv2.data.haarcascades)
+    except AttributeError:
+        pass
+    for path in (
+        "/usr/share/opencv4/haarcascades/",
+        "/usr/share/opencv/haarcascades/",
+        "/usr/local/share/opencv4/haarcascades/",
+        "/usr/local/share/opencv/haarcascades/",
+    ):
+        dirs.append(path)
+    return dirs
+
+
+def find_cascade(fname):
+    """Tra ve duong dan cascade ton tai, else None."""
+    for d in cascade_candidates():
+        path = os.path.join(d, fname)
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 class CaptureThread(threading.Thread):
@@ -114,7 +146,7 @@ class DetectorThread(threading.Thread):
 
     def __init__(self, work_width=DETECT_SCALE):
         super().__init__(daemon=True)
-        self.work_width = work_width
+        self.work_width = max(work_width, 320)
         self._frame = None
         self._new = threading.Event()
         self._lock = threading.Lock()
@@ -122,6 +154,7 @@ class DetectorThread(threading.Thread):
         self.detect_fps = 0.0
         self.loaded = False
         self.error = None
+        self._warned = False
 
     def submit(self, frame):
         with self._lock:
@@ -131,15 +164,28 @@ class DetectorThread(threading.Thread):
     def run(self):
         cascades = {}
         for label, (fname, color, minsize, minn) in CASCADES.items():
-            path = os.path.join(cv2.data.haarcascades, fname)
+            path = find_cascade(fname)
+            if path is None:
+                print(f"[w] cascade khong tim thay: {fname} -> bo qua lop '{label}'")
+                continue
             cascade = cv2.CascadeClassifier(path)
             if cascade.empty():
-                self.error = f"Khong the tai classifier: {path}"
-                print(f"[!] {self.error}")
-                return
+                print(f"[w] cascade loi: {path} -> bo qua lop '{label}'")
+                continue
             cascades[label] = (cascade, color, minsize, minn)
+
+        if not cascades:
+            self.error = "Khong co cascade nao tai duoc"
+            print(f"[!] {self.error}")
+            return
+
+        # HOG people detector duoc tich hop san trong OpenCV
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+
         self.loaded = True
-        print("[*] detector ready: person / upper / lower / face (Haar)")
+        names = ", ".join(LABELS[k] for k in cascades)
+        print(f"[*] detector ready: {names} + person(HOG)")
 
         while True:
             self._new.wait()
@@ -149,13 +195,18 @@ class DetectorThread(threading.Thread):
             if frame is None:
                 continue
             t0 = time.perf_counter()
-            self.detections = self._detect(frame, cascades)
+            try:
+                self.detections = self._detect(frame, cascades, hog)
+            except Exception as exc:
+                if not self._warned:
+                    self._warned = True
+                    print(f"[w] loi detection (bo qua): {exc}")
             self.detect_fps = self._ema(time.perf_counter() - t0)
 
-    def _detect(self, frame, cascades):
+    def _detect(self, frame, cascades, hog):
         h, w = frame.shape[:2]
-        scale = self.work_width / float(w)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        scale = self.work_width / float(w)
         if scale < 1.0:
             small = cv2.resize(
                 gray, (self.work_width, max(1, int(h * scale))),
@@ -165,21 +216,63 @@ class DetectorThread(threading.Thread):
             scale = 1.0
             small = gray
 
-        results = []
+        # Tang tuong phan giup Haar nhan dien tot khi thieu sang
+        small_eq = cv2.equalizeHist(small)
         inv = 1.0 / scale
+        results = []
+        persons = []
+
+        # Haar: than tren / than duoi / mat + fullbody
         for label, (cascade, color, minsize, minn) in cascades.items():
             rects = cascade.detectMultiScale(
-                small, scaleFactor=1.1, minNeighbors=minn, minSize=minsize,
+                small_eq, scaleFactor=1.05, minNeighbors=minn, minSize=minsize,
             )
             if len(rects) == 0:
                 continue
             for (x, y, bw, bh) in rects:
-                x1 = int(x * inv)
-                y1 = int(y * inv)
-                x2 = int((x + bw) * inv)
-                y2 = int((y + bh) * inv)
-                results.append((label, color, x1, y1, x2, y2))
+                x1, y1 = int(x * inv), int(y * inv)
+                x2, y2 = int((x + bw) * inv), int((y + bh) * inv)
+                if label == "person":
+                    persons.append((x1, y1, x2 - x1, y2 - y1))
+                else:
+                    results.append((LABELS[label], color, x1, y1, x2, y2))
+
+        # Neu Haar fullbody chua thay nguoi -> chay HOG people detector
+        if not persons:
+            rects, _ = hog.detectMultiScale(
+                small, winStride=(8, 8), padding=(8, 8), scale=1.05,
+            )
+            if len(rects) > 0:
+                for (x, y, bw, bh) in rects:
+                    x1, y1 = int(x * inv), int(y * inv)
+                    x2, y2 = int((x + bw) * inv), int((y + bh) * inv)
+                    persons.append((x1, y1, x2 - x1, y2 - y1))
+
+        # Gom cac box nguoi trung nhau
+        for (x, y, bw, bh) in self._nms(persons):
+            results.append(("nguoi", (0, 255, 0), x, y, x + bw, y + bh))
+
         return results
+
+    @staticmethod
+    def _iou(a, b):
+        x1 = max(a[0], b[0])
+        y1 = max(a[1], b[1])
+        x2 = min(a[0] + a[2], b[0] + b[2])
+        y2 = min(a[1] + a[3], b[1] + b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        if inter <= 0:
+            return 0.0
+        union = a[2] * a[3] + b[2] * b[3] - inter
+        return inter / union if union > 0 else 0.0
+
+    def _nms(self, boxes, thresh=0.4):
+        boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+        keep = []
+        for b in boxes:
+            if all(self._iou(b, k) < thresh for k in keep):
+                keep.append(b)
+        return keep
 
     def _ema(self, elapsed):
         instant = 1.0 / elapsed if elapsed > 0 else 0.0
@@ -239,16 +332,16 @@ def main():
     blank = np.zeros((args.height, args.width, 3), dtype=np.uint8)
 
     print("""
-Pi 4 Camera Controller (Turbo)
-==============================
+Pi 4 Camera Controller (Turbo v3)
+=================================
 Controls:
   SPACE : camera on/off         D : toggle detection
   S     : take photo (JPG)      R : toggle video recording
   Q/ESC : quit
 
 Detection colors:
-  green  = person      orange = upper body
-  blue   = lower body  cyan   = face
+  green  = nguoi       orange = than_tren
+  blue   = than_duoi   cyan   = mat
 """)
 
     loop_t = time.perf_counter()
@@ -290,7 +383,7 @@ Detection colors:
                         draw_shadow(overlay, label, (x1, max(y1 - 8, 20)),
                                     scale=0.55, color=color, thickness=1)
                 elif det.error:
-                    draw_shadow(overlay, "Detector: unavailable", (12, 190), color=(0, 0, 255))
+                    draw_shadow(overlay, f"Detector: {det.error}", (12, 190), color=(0, 0, 255))
             else:
                 draw_shadow(overlay, "Detection OFF", (12, 190), scale=0.55, color=(0, 165, 255))
 
